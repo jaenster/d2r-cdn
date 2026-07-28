@@ -8,16 +8,21 @@
 #   MAX=1 ./mirror.sh /tmp/d2r        # just the first archive (test)
 #   PRODUCT=osib REGION=eu ./mirror.sh <dir>
 set -euo pipefail
+export LC_ALL=C  # byte-oriented awk; CDN text can carry stray high bytes
 
 DEST="${1:?usage: mirror.sh <dest-dir>  (env: PRODUCT REGION MAX)}"
 PRODUCT="${PRODUCT:-osi}"; REGION="${REGION:-us}"
-PATCH="http://${REGION}.patch.battle.net:1119/${PRODUCT}"
+# Always query a reachable patch host; REGION only selects which row we use. (Building
+# the host from REGION breaks cn -> cn.patch.battle.net is unreachable outside China.)
+PATCHHOST="${PATCHHOST:-us.patch.battle.net}"
+PATCH="http://${PATCHHOST}:1119/${PRODUCT}"
 row() { awk -F'|' -v r="$REGION" '/^#/||/!/{next} $1==r{print;exit}'; }
 
-V=$(curl -sf "$PATCH/versions" | row)
-C=$(curl -sf "$PATCH/cdns" | row)
+first() { awk -F'|' '/^#/||/!/{next} NF>3{print;exit}'; }  # first data row, any region
+VR=$(curl -sf "$PATCH/versions"); V=$(echo "$VR" | row); [ -z "$V" ] && V=$(echo "$VR" | first)
+CR=$(curl -sf "$PATCH/cdns"); C=$(echo "$CR" | row); [ -z "$C" ] && C=$(echo "$CR" | first)
 BC=$(echo "$V" | cut -d'|' -f2); CC=$(echo "$V" | cut -d'|' -f3)
-CPATH=$(echo "$C" | cut -d'|' -f2); HOST=$(echo "$C" | cut -d'|' -f3 | awk '{print $1}')
+CPATH=$(echo "$C" | cut -d'|' -f2); HOST="${CDNHOST:-$(echo "$C" | cut -d'|' -f3 | awk '{print $1}')}"
 BASE="http://$HOST/$CPATH"
 echo "mirror $PRODUCT/$REGION build $(echo "$V" | cut -d'|' -f5)  ->  $DEST"
 echo "cdn $BASE"
@@ -48,7 +53,8 @@ TOTAL=$(echo "$ARCHES" | wc -w | tr -d ' ')
 echo "archives: $TOTAL total  (s=skip . =downloaded X=fail)"
 i=0; MAX="${MAX:-0}"
 for a in $ARCHES; do
-  dl data "$a" .index; dl data "$a"
+  dl data "$a" .index
+  [ -z "${MANIFESTS:-}" ] && dl data "$a"   # MANIFESTS=1 -> indices only, skip 256MB blobs
   i=$((i+1))
   [ $((i % 10)) -eq 0 ] && printf ' [%d/%d]\n' "$i" "$TOTAL"
   [ "$MAX" != 0 ] && [ "$i" -ge "$MAX" ] && break
