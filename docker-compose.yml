@@ -1,0 +1,16 @@
+# Synology Container Manager: Project -> Create -> use this compose file.
+# Point the volume at a share with TBs free. Set DISCORD_WEBHOOK in a .env next to
+# this file (or in the Container Manager env UI) to get alerts.
+services:
+  d2r-scraper:
+    build: .
+    image: d2r-cdn-scraper:latest
+    container_name: d2r-scraper
+    restart: unless-stopped
+    environment:
+      - INTERVAL=60          # poll every product every 60s
+      - DATA=1               # download full data on any new plaintext build
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK:-}
+      - TZ=Europe/Amsterdam
+    volumes:
+      - /volume1/d2r-cdn:/data   # <-- change to your NAS share; needs TBs free
