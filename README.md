@@ -18,6 +18,13 @@ encoding CKey=6aef7e01...  md5(decoded)==CKey? true
 archive file: EKey=a833783f...  640 bytes -> BLTE-decoded 780 bytes
 ```
 
+Mirror the whole thing (raw blobs, resumable, ~37GB):
+
+```
+./mirror.sh <dir>          # re-run to resume; skips complete files
+MAX=1 ./mirror.sh /tmp/d2r # just the first archive (test)
+```
+
 Or poke around by hand with `curl`:
 
 ```
