@@ -18,6 +18,12 @@ encoding CKey=6aef7e01...  md5(decoded)==CKey? true
 archive file: EKey=a833783f...  640 bytes -> BLTE-decoded 780 bytes
 ```
 
+List every file in the build (install + root catalog, no big download):
+
+```
+zig run list.zig 2>/dev/null | sort -u   # ~175k paths
+```
+
 Mirror the whole thing (raw blobs, resumable, ~37GB):
 
 ```
