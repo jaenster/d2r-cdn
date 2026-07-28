@@ -186,6 +186,18 @@ Only steps 1-2 are needed to enumerate what a build contains; steps 3+ (encoding
 root, BLTE) are needed to pull a specific named file, and are where a real library
 earns its keep.
 
+### Gotcha: EKey is a locator, not a checksum of the blob
+
+Intuition says the file served at `data/<ab>/<cd>/<EKey>` should md5 to `EKey`. It
+does NOT. Verified on live D2R: the encoding blob at `data/b3/d7/b3d7bdad...` md5s
+to `c3db7fc7...`, not its EKey. Config files ARE content-addressed (a build config
+md5s to its own name), but BLTE data blobs are not addressed by md5-of-blob.
+
+The real integrity check is on the DECODED side: **CKey = md5 of the decoded
+file**. Fetch by EKey (the locator), BLTE-decode, then `md5(decoded) == CKey`. This
+is confirmed in `tact.zig`: the decoded encoding table md5s to exactly the CKey
+listed in the build config. So treat EKey as an opaque address and verify with CKey.
+
 ## The reference tool
 
 `osi-cdn.sh` does everything reachable with pure `curl` - resolve the version
@@ -208,6 +220,46 @@ PRODUCT=osib REGION=eu ./osi-cdn.sh info
 
 It intentionally stops at raw blobs - decoding encoding/root/BLTE is a library job.
 
+## The native fetcher (tact.zig)
+
+`tact.zig` is a from-scratch Zig 0.16 client (pure std: `std.http.Client`,
+`std.compress.flate`, `std.crypto.hash.Md5` - no external deps) that goes all the
+way to real file bytes. Run it:
+
+```
+zig run tact.zig
+```
+
+It, against the live `osi` product:
+
+- resolves versions -> build/cdn config,
+- fetches the encoding manifest, BLTE-decodes it, and verifies `md5(decoded) == CKey`,
+- parses a data archive's `.index` (EKey -> size, offset within the archive),
+- byte-range-fetches the smallest file out of that ~256MB archive and BLTE-decodes it.
+
+Sample run:
+
+```
+D2R 3.2.92777 (build 92777)   cdn http://level3.blizzard.com/tpr/osi
+cdn config: 146 data archives (~256MB each)
+encoding  CKey=6aef7e01...  EKey=b3d7bdad...  decoded-size 10778382
+BLTE-decoded: 10778382 bytes, magic EN
+md5(decoded)=6aef7e01630b49301d82ad1d88bd0e24  == CKey? true
+archive 005402ec....index: 489 entries, key=16 size=4 off=4 bytes/page=4096
+smallest file: EKey=a833783f...  offset=268434804  size=640  -> range-fetched 640 bytes
+BLTE-decoded file: 780 bytes
+```
+
+### The `.index` binary format (per-archive)
+
+Each `<archive>.index` is 4096-byte pages of sorted entries, then a TOC, then a
+28-byte footer. Footer fields (from the end): `blockSizeKB`, `offsetBytes`,
+`sizeBytes`, `keySizeBytes`, `checksumSize`, then `numElements` (uint32 LE). Each
+entry is `EKey[keySize] | size[sizeBytes] BE | offset[offsetBytes] BE`, sorted by
+EKey (so files are scattered by offset). For D2R: page 4096, key 16, size 4, off 4
+-> 24-byte entries, 170 per page. The offset/size point straight into the archive
+blob (offset 0, 1225478, 2337190 ... are all real BLTE starts - verified).
+
 ## Going further - existing decoders
 
 Don't reimplement BLTE + encoding + root by hand unless you want to. Mature tools:
@@ -215,6 +267,8 @@ Don't reimplement BLTE + encoding + root by hand unless you want to. Mature tool
 - CASCLib (Ladislav Zezula) - C++, reads both online (TACT) and installed (CASC).
 - TACT.Net / BuildBackup - C#, full online pipeline incl. archive assembly.
 - keg (Ribbit/TACT client) and casc-tools - Go.
+- blizzget (d07RiV) - compact C++ NGDP downloader; its `ngdp.cpp` (BLTE decode,
+  encoding table, index-entry layout) is a clear, readable reference.
 - wowdev.wiki - the canonical protocol reference (TACT, CASC, BLTE, Ribbit pages).
 
 ## Note
