@@ -28,8 +28,8 @@ Or poke around by hand with `curl`:
 
 ## How it works
 
-`versions → build/cdn config → encoding (CKey↔EKey) → .index (EKey→archive+offset)
-→ byte-range fetch → BLTE decode`.
+`versions -> build/cdn config -> encoding (CKey<->EKey) -> .index (EKey->archive+offset)
+-> byte-range fetch -> BLTE decode`.
 
 The details (BLTE framing, the `.index` binary layout, the EKey-is-a-locator
 gotcha) live as comments in [`tact.zig`](tact.zig).
