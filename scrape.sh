@@ -77,7 +77,7 @@ scan_once() {
 
     local pool="$DEST/pool"; mkdir -p "$pool"
 
-    # new build -> alert + fingerprint (small, synchronous, keeps the poll snappy)
+    # new build detected (fast - just the version check above) -> alert + record it.
     if [ "$bc" != "$last" ]; then
       if [ -z "$last" ]; then alert "D2R NEW PRODUCT: $p  $ver  [$tag]$keymsg  ($region)"
       else alert "D2R $p NEW BUILD: $ver  [$tag]$keymsg  ($region)"; fi
@@ -85,34 +85,31 @@ scan_once() {
       printf '{"product":"%s","version":"%s","region":"%s","build_config":"%s","encrypted":%s,"key_name":"%s","ts":"%s"}\n' \
         "$p" "$ver" "$region" "$bc" "$([ "$enc" = 1 ] && echo true || echo false)" "$keyname" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         > "$DEST/builds/$p/$ver.json"
-      if MANIFESTS=1 PRODUCT="$p" REGION="$region" CDNHOST=level3.blizzard.com "$HERE/mirror.sh" "$pool" >>"$pool/capture.log" 2>&1; then
-        echo "$bc" > "$STATE/$p"; echo "     fingerprint captured [$tag]$keymsg"
-      else
-        alert "D2R $p CAPTURE FAILED for $ver (will retry)"; continue
-      fi
+      echo "$bc" > "$STATE/$p"
     fi
 
-    # full data (plaintext only; encrypted cdn-config can't be enumerated). Runs in
-    # the BACKGROUND behind a single-flight lock: never double-downloads, and if a
-    # build's data isn't marked done it retries next scan (mirror.sh resumes).
+    # Download the whole build (configs + indices + data) into the pool. ONE download
+    # at a time across ALL products (a single global lock), in the background, so
+    # nothing competes for the uplink and the poll keeps detecting. Plaintext only
+    # (encrypted channels have no readable archive list). Retries each scan until
+    # $STATE/$p.data == this build. mirror.sh is resumable.
     if [ -n "${DATA:-}" ] && [ "$enc" = 0 ]; then
       local ddone=""; [ -f "$STATE/$p.data" ] && ddone=$(cat "$STATE/$p.data")
-      local lock="$pool/.lock-$p"
-      if [ "$bc" != "$ddone" ] && mkdir "$lock" 2>/dev/null; then
-        alert "D2R $p DOWNLOADING full data $ver ..."
+      if [ "$bc" != "$ddone" ] && mkdir "$pool/.lock" 2>/dev/null; then
+        alert "D2R $p DOWNLOADING $ver ..."
         ( if PRODUCT="$p" REGION="$region" CDNHOST=level3.blizzard.com "$HERE/mirror.sh" "$pool" >>"$pool/data.log" 2>&1; then
             echo "$bc" > "$STATE/$p.data"
-            alert "D2R $p DATA COMPLETE $ver (pool now $(du -sh "$pool" 2>/dev/null | cut -f1))"
+            alert "D2R $p DONE $ver (pool $(du -sh "$pool" 2>/dev/null | cut -f1))"
           else
-            alert "D2R $p data download FAILED $ver (will retry)"
+            alert "D2R $p download FAILED $ver (will retry)"
           fi
-          rmdir "$lock" 2>/dev/null ) &
+          rmdir "$pool/.lock" 2>/dev/null ) &
       fi
     fi
   done
 }
 
-rm -rf "$DEST/pool/.lock-"* 2>/dev/null  # clear stale download locks from a prior run
+rm -rf "$DEST/pool/.lock" "$DEST/pool/.lock-"* 2>/dev/null  # clear stale download lock from a prior run
 echo "scrape $(echo "$PRODUCTS" | wc -w | tr -d ' ') candidate products -> $DEST"
 if [ -n "${INTERVAL:-}" ]; then
   while true; do echo "--- scan $(date -u +%H:%M:%S) ---"; scan_once; sleep "$INTERVAL"; done
