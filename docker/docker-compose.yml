@@ -1,15 +1,16 @@
-# Run from the repo root:  DISCORD_WEBHOOK=... docker compose -f docker/docker-compose.yml up -d
+# Channel watcher: polls every D2R product every 60s, captures new builds into a
+# shared content-addressed pool on the volume, alerts on Discord.
+#   DISCORD_WEBHOOK=... docker compose -f docker/docker-compose.yml up -d
 services:
-  d2r-scraper:
+  d2r-cdn:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: d2r-scraper:latest
-    container_name: d2r-scraper
+    image: d2r-cdn:latest
+    container_name: d2r-cdn
     restart: unless-stopped
+    command: ["watch", "/data", "--interval", "60", "--data"]
     environment:
-      - INTERVAL=60          # poll every product every 60s
-      - DATA=1               # download full data on any new plaintext build
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK:-}
       - TZ=Europe/Amsterdam
     volumes:

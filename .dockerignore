@@ -1,0 +1,8 @@
+.git
+.zig-cache
+zig-out
+pool
+extracted
+binaries
+*-linux
+.env
