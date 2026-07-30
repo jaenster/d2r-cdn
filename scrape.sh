@@ -40,16 +40,21 @@ scan_once() {
     V=$(curl -sf -m 8 "http://$PATCHHOST:1119/$p/versions" 2>/dev/null \
         | awk -F'|' '!/!/&&!/^#/&&$2{print;exit}') || continue
     [ -z "$V" ] && continue
-    local region bc ver P enc=1
+    local region bc ver P enc=""
     region=$(echo "$V" | cut -d'|' -f1)
     bc=$(echo "$V" | cut -d'|' -f2)
     ver=$(echo "$V" | cut -d'|' -f6)
     [ -z "$bc" ] && continue
-    P=$(curl -sf -m 8 "http://$PATCHHOST:1119/$p/cdns" | awk -F'|' '!/!/&&!/^#/&&$2{print $2;exit}')
-    # plaintext vs encrypted: can we read the build config as text?
-    curl -sf -m 8 "http://level3.blizzard.com/$P/config/${bc:0:2}/${bc:2:2}/$bc" 2>/dev/null \
-      | grep -q 'build-name\|^root' && enc=0
-    local tag=ENCRYPTED; [ "$enc" = 0 ] && tag=PLAINTEXT
+    P=$(curl -sf --retry 3 --retry-delay 2 -m 15 "http://$PATCHHOST:1119/$p/cdns" | awk -F'|' '!/!/&&!/^#/&&$2{print $2;exit}')
+    # Classify: plaintext (readable config) vs encrypted vs UNKNOWN (fetch failed).
+    # CRITICAL: a failed fetch stays UNKNOWN (enc=""), never "encrypted" - otherwise
+    # a later successful read looks like encrypted->plaintext and false-alarms.
+    local cfg
+    cfg=$(curl -sf --retry 3 --retry-delay 2 -m 20 "http://level3.blizzard.com/$P/config/${bc:0:2}/${bc:2:2}/$bc" 2>/dev/null || true)
+    if [ -n "$cfg" ]; then
+      if printf '%s' "$cfg" | grep -q 'build-name\|^root'; then enc=0; else enc=1; fi
+    fi
+    local tag=UNKNOWN; [ "$enc" = 0 ] && tag=PLAINTEXT; [ "$enc" = 1 ] && tag=ENCRYPTED
 
     # for encrypted channels, learn WHICH key it needs (Armadillo: productconfig
     # carries decryption_key_name). We can't decrypt without it, but we record what
@@ -65,15 +70,17 @@ scan_once() {
     fi
     local keymsg=""; [ -n "$keyname" ] && keymsg=" needs-key=$keyname"
 
-    local last="" lastenc=""
-    [ -f "$STATE/$p" ] && last=$(cat "$STATE/$p")
-    [ -f "$STATE/$p.enc" ] && lastenc=$(cat "$STATE/$p.enc")
+    local last=""; [ -f "$STATE/$p" ] && last=$(cat "$STATE/$p")
 
-    # THE ALARM: a channel that was encrypted is now readable = likely internal leak.
-    if [ "$lastenc" = 1 ] && [ "$enc" = 0 ]; then
-      alert "@@@ D2R $p WENT PLAINTEXT (was encrypted) - $ver - POSSIBLE INTERNAL LEAK @@@"
+    # THE ALARM only runs when THIS scan's state is known (enc non-empty). A confirmed
+    # was-encrypted -> now-plaintext transition (both real reads) = likely leak.
+    if [ -n "$enc" ]; then
+      local lastenc=""; [ -f "$STATE/$p.enc" ] && lastenc=$(cat "$STATE/$p.enc")
+      if [ "$lastenc" = 1 ] && [ "$enc" = 0 ]; then
+        alert "@@@ D2R $p WENT PLAINTEXT (was encrypted) - $ver - POSSIBLE INTERNAL LEAK @@@"
+      fi
+      echo "$enc" > "$STATE/$p.enc"
     fi
-    echo "$enc" > "$STATE/$p.enc"
 
     local pool="$DEST/pool"; mkdir -p "$pool"
 
