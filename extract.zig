@@ -321,6 +321,12 @@ pub fn main() !void {
     var loose: usize = 0;
     for (ents.items) |e| {
         if (e.arch != 0xffffffff) continue;
+        const rel0 = if (std.mem.startsWith(u8, e.path, "data:")) e.path[5..] else e.path;
+        const op0 = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ OUT, rel0 });
+        if (dir.access(io_, op0, .{})) |_| {
+            loose += 1;
+            continue;
+        } else |_| {}
         const ekhex = std.fmt.bytesToHex(e.ekey, .lower);
         const raw = readLocal(gpa, "data", &ekhex, "") catch {
             miss += 1;
