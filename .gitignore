@@ -1,3 +1,9 @@
 .DS_Store
 *.tmp
 .env
+zig-out/
+.zig-cache/
+*-linux
+pool/
+extracted/
+binaries/

@@ -10,8 +10,10 @@ const std = @import("std");
 const http = std.http;
 const flate = std.compress.flate;
 
-const POOL = "/volume1/Media/d2r-cdn/pool";
-const OUT = "/volume1/Media/d2r-cdn/extracted/osi";
+// Set these before building. POOL is a content-addressed mirror (config/ + data/ by
+// hash, from scripts/mirror.sh); OUT is where the extracted game tree is written.
+const POOL = "pool";
+const OUT = "extracted/osi";
 const PRODUCT = "osi";
 const REGION = "us";
 

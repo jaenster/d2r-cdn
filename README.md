@@ -1,53 +1,58 @@
 # d2r-cdn
 
-Fetch Diablo II: Resurrected files straight from Blizzard's CDN (NGDP/TACT), in
-pure Zig — no deps, no game content bundled.
+Fetch and extract Diablo II: Resurrected files from Blizzard's CDN (NGDP/TACT/CASC)
+in Zig. No dependencies, no game content included. (`osi` is D2R's product code.)
 
-## Run it
-
-```
-zig run tact.zig
-```
-
-Resolves the live D2R build, downloads a real file from a data archive, and
-BLTE-decodes it:
+## Library
 
 ```
-D2R 3.2.92777 (build 92777)
-encoding CKey=6aef7e01...  md5(decoded)==CKey? true
-archive file: EKey=a833783f...  640 bytes -> BLTE-decoded 780 bytes
+zig fetch --save git+https://github.com/jaenster/d2r-cdn
 ```
 
-List every file in the build (install + root catalog, no big download):
+```zig
+const tact = @import("tact");
 
-```
-zig run list.zig 2>/dev/null | sort -u   # ~175k paths
-```
-
-Mirror the whole thing (raw blobs, resumable, ~37GB):
-
-```
-./mirror.sh <dir>          # re-run to resume; skips complete files
-MAX=1 ./mirror.sh /tmp/d2r # just the first archive (test)
+var cdn = try tact.Cdn.open(gpa, io, "osi", "us"); // resolve the current build
+defer cdn.close();
+const exe = try cdn.extractInstall("D2R.exe");     // decoded file bytes
 ```
 
-Or poke around by hand with `curl`:
+`Cdn` resolves a product's current build (versions → build/cdn config) and exposes
+BLTE decode, the encoding CKey↔EKey map, archive-index lookup, and per-file
+extraction. Everything is in `src/tact.zig`.
+
+## Build
 
 ```
-./osi-cdn.sh info          # build, version, cdn hosts
-./osi-cdn.sh archives      # list data archives
-./osi-cdn.sh data <hash>   # download a blob
+zig build            # library + the d2r-fetch example
+zig build test
+./zig-out/bin/d2r-fetch
 ```
 
-## How it works
+## Tools
 
-`versions -> build/cdn config -> encoding (CKey<->EKey) -> .index (EKey->archive+offset)
--> byte-range fetch -> BLTE decode`.
+```
+zig run tools/list.zig      # list every file in a build
+zig run tools/extract.zig   # extract a full game tree from a local mirror
+```
 
-The details (BLTE framing, the `.index` binary layout, the EKey-is-a-locator
-gotcha) live as comments in [`tact.zig`](tact.zig).
+## Scripts
+
+```
+scripts/osi-cdn.sh info     # build id, version, cdn hosts (curl only)
+scripts/mirror.sh <dir>     # resumable full mirror of a build
+scripts/scrape.sh <dir>     # watch every product channel, capture new builds
+```
+
+The scraper also runs as a container — see `docker/` and `DEPLOY-synology.md`.
+
+## Format notes
+
+- Content is addressed by MD5: a hash `abcdef…` lives at `<base>/<kind>/ab/cd/abcdef…`.
+- Data blobs are BLTE-framed (`N` raw, `Z` zlib, `F` frame, `E` encrypted).
+- EKey is the CDN locator; CKey (md5 of the decoded file) is the integrity check.
 
 ---
 
-*Metadata client only; ships no game data. D2R is a trademark of Blizzard
-Entertainment; unaffiliated.*
+Diablo II: Resurrected is a trademark of Blizzard Entertainment. This project is
+unaffiliated and ships no game data.

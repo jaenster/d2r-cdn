@@ -1,0 +1,16 @@
+# Run from the repo root:  DISCORD_WEBHOOK=... docker compose -f docker/docker-compose.yml up -d
+services:
+  d2r-scraper:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: d2r-scraper:latest
+    container_name: d2r-scraper
+    restart: unless-stopped
+    environment:
+      - INTERVAL=60          # poll every product every 60s
+      - DATA=1               # download full data on any new plaintext build
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK:-}
+      - TZ=Europe/Amsterdam
+    volumes:
+      - ./d2r-data:/data     # point this at a disk with room (tens of GB per build)
