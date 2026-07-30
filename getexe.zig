@@ -324,6 +324,5 @@ pub fn main() !void {
         wrote += 1;
         std.debug.print("  {s}  {d} bytes  md5==CKey:{}\n", .{ b.name, fileb.len, ok });
     }
-    _ = located;
     std.debug.print("[getexe] wrote {d}/{d} files, {d} bytes total\n", .{ wrote, nb, total });
 }
