@@ -3,7 +3,18 @@
 Fetch and extract Diablo II: Resurrected files from Blizzard's CDN (NGDP/TACT/CASC)
 in Zig. No dependencies, no game content included. (`osi` is D2R's product code.)
 
-It is a library, `tact`, and a CLI that does everything the library can.
+It is a library, `tact`, and a CLI that does everything the library can. Nothing to
+install if you have docker:
+
+```
+docker run --rm ghcr.io/jaenster/d2r-cdn info            # what is live right now
+docker run --rm ghcr.io/jaenster/d2r-cdn list --root     # every file in that build
+docker run --rm -v $PWD:/data ghcr.io/jaenster/d2r-cdn fetch D2R.exe -o /data
+```
+
+The image is the CLI, so every command below works the same way behind
+`docker run --rm ghcr.io/jaenster/d2r-cdn`. It is amd64 + arm64, published by CI on
+every push to main.
 
 ## CLI
 
@@ -62,15 +73,21 @@ It is all in `src/tact.zig`. `example/fetch.zig` is the smallest thing that uses
 
 ## Docker
 
+`ghcr.io/jaenster/d2r-cdn` is the CLI on a static musl build (~28MB), so anything the
+CLI does is one `docker run` away. Mount a volume on `/data` when you want files back:
+
 ```
-docker build -f docker/Dockerfile -t d2r-cdn .
-docker run --rm d2r-cdn info
-docker run --rm -v $PWD/data:/data d2r-cdn extract 'data:*/excel/*' -o /data/game
+docker run --rm ghcr.io/jaenster/d2r-cdn -p osib info          # the beta channel
+docker run --rm -v $PWD/data:/data ghcr.io/jaenster/d2r-cdn \
+  extract 'data:*/excel/*' -o /data/game
 DISCORD_WEBHOOK=... docker compose -f docker/docker-compose.yml up -d   # the watcher
 ```
 
-The image is the CLI on a static musl build (~28MB); compose runs it as the channel
-watcher — see `DEPLOY-synology.md`.
+CI builds it for amd64 and arm64 on every push to main (zig cross-compiles, so neither
+arch needs emulation) and tags `:latest`, `:<sha>`, and any `v*` tag. To build the
+working tree instead: `docker build -f docker/Dockerfile -t d2r-cdn .`
+
+Compose runs the same image as the channel watcher — see `DEPLOY-synology.md`.
 
 ## Scripts
 

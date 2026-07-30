@@ -1,12 +1,16 @@
 # Channel watcher: polls every D2R product every 60s, captures new builds into a
 # shared content-addressed pool on the volume, alerts on Discord.
 #   DISCORD_WEBHOOK=... docker compose -f docker/docker-compose.yml up -d
+#
+# Pulls the image the pipeline publishes. To run your own working tree instead,
+# uncomment `build:` and `docker compose ... up -d --build`.
 services:
   d2r-cdn:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: d2r-cdn:latest
+    image: ghcr.io/jaenster/d2r-cdn:latest
+    pull_policy: always
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
     container_name: d2r-cdn
     restart: unless-stopped
     command: ["watch", "/data", "--interval", "60", "--data"]

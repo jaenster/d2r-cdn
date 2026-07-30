@@ -1,19 +1,25 @@
 # Run the watcher on a Synology NAS
 
 Watches every D2R product channel and downloads new builds into a mounted share.
+Nothing is built on the NAS: it pulls `ghcr.io/jaenster/d2r-cdn` from the pipeline.
 
 ## Container Manager
 
-1. Copy the repo onto the NAS (e.g. `/volume1/Media/d2r-cdn`).
-2. In `docker/docker-compose.yml`, point the volume at a share with room:
-   `- /volume1/<share>/d2r-data:/data`.
-3. Optional: create `.env` with `DISCORD_WEBHOOK=...` for alerts.
-4. Container Manager → Project → Create → point it at the repo folder.
+1. Put `docker/docker-compose.yml` somewhere on the NAS (that one file is enough).
+2. Point the volume at a share with room: `- /volume1/<share>/d2r-data:/data`.
+3. Optional: create `.env` next to it with `DISCORD_WEBHOOK=...` for alerts.
+4. Container Manager → Project → Create → point it at that folder.
 
 Or from a shell with docker:
 
 ```
 DISCORD_WEBHOOK=... docker compose -f docker/docker-compose.yml up -d
+```
+
+To update, pull and recreate — `pull_policy: always` means a restart is enough:
+
+```
+docker compose -f docker/docker-compose.yml up -d --pull always
 ```
 
 ## On disk (under the mounted volume)
@@ -36,10 +42,10 @@ First run downloads the current builds in full (tens of GB); after that only cha
 data. To skip the baseline, drop an existing mirror's `config/` + `data/` into `pool/`
 first — anything already present (matched by hash and size) is skipped.
 
-The same image is the whole toolbox, so the NAS can also serve files out of the pool
-it already has:
+The same image is the whole toolbox, so the NAS can also extract a real game tree out
+of the pool it already has, without re-downloading anything:
 
 ```
-docker compose -f docker/docker-compose.yml run --rm --entrypoint d2r-cdn d2r-cdn \
+docker run --rm -v /volume1/<share>/d2r-data:/data ghcr.io/jaenster/d2r-cdn \
   --pool /data/pool extract -o /data/game
 ```
