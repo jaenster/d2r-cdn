@@ -23,9 +23,11 @@ var base: []const u8 = "";
 // read a content-addressed blob: local pool first, else fetch from the CDN (for
 // blobs the mirror didn't grab - e.g. root, which the build config lists CKey-only).
 fn readLocal(gpa: std.mem.Allocator, kind: []const u8, hash: []const u8, ext: []const u8) ![]u8 {
-    const p = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}/{s}/{s}{s}", .{ POOL, kind, hash[0..2], hash[2..4], hash, ext });
+    var pbuf: [512]u8 = undefined;
+    const p = try std.fmt.bufPrint(&pbuf, "{s}/{s}/{s}/{s}/{s}{s}", .{ POOL, kind, hash[0..2], hash[2..4], hash, ext });
     if (dir.readFileAlloc(io_, p, gpa, .unlimited)) |d| return d else |_| {}
-    const url = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}/{s}/{s}{s}", .{ base, kind, hash[0..2], hash[2..4], hash, ext });
+    var ubuf: [512]u8 = undefined;
+    const url = try std.fmt.bufPrint(&ubuf, "{s}/{s}/{s}/{s}/{s}{s}", .{ base, kind, hash[0..2], hash[2..4], hash, ext });
     var aw = std.Io.Writer.Allocating.init(gpa);
     const res = try client.fetch(.{ .location = .{ .url = url }, .response_writer = &aw.writer });
     if (res.status != .ok) return error.Http;
@@ -152,6 +154,7 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
+    const pa = std.heap.page_allocator; // real free() for big per-archive/per-file temporaries
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     io_ = threaded.io();
@@ -297,16 +300,16 @@ pub fn main() !void {
             }
         }
         if (!any) continue;
-        const blob = readLocal(gpa, "data", ah, "") catch {
+        const blob = readLocal(pa, "data", ah, "") catch {
             std.debug.print("  archive {s} missing locally\n", .{ah[0..12]});
             continue;
         };
-        defer gpa.free(blob);
+        defer pa.free(blob);
         for (ents.items) |e| {
             if (e.arch != ai) continue;
             const raw = blob[e.off .. e.off + e.size];
-            const file = blte(gpa, raw) catch continue;
-            defer gpa.free(file);
+            const file = blte(pa, raw) catch continue;
+            defer pa.free(file);
             const rel = if (std.mem.startsWith(u8, e.path, "data:")) e.path[5..] else e.path;
             const outpath = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ OUT, rel });
             if (std.fs.path.dirname(outpath)) |d| dir.createDirPath(io_, d) catch {};
@@ -328,13 +331,13 @@ pub fn main() !void {
             continue;
         } else |_| {}
         const ekhex = std.fmt.bytesToHex(e.ekey, .lower);
-        const raw = readLocal(gpa, "data", &ekhex, "") catch {
+        const raw = readLocal(pa, "data", &ekhex, "") catch {
             miss += 1;
             continue;
         };
-        defer gpa.free(raw);
-        const file = blte(gpa, raw) catch continue;
-        defer gpa.free(file);
+        defer pa.free(raw);
+        const file = blte(pa, raw) catch continue;
+        defer pa.free(file);
         const rel = if (std.mem.startsWith(u8, e.path, "data:")) e.path[5..] else e.path;
         const outpath = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ OUT, rel });
         if (std.fs.path.dirname(outpath)) |d| dir.createDirPath(io_, d) catch {};
