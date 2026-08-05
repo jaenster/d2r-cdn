@@ -1,5 +1,7 @@
 # d2r-cdn
 
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/MHK2Dg9)
+
 Fetch and extract Diablo II: Resurrected files from Blizzard's CDN (NGDP/TACT/CASC)
 in Zig. No dependencies, no game content included. (`osi` is D2R's product code.)
 
