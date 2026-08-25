@@ -114,3 +114,10 @@ scripts/scrape.sh <dir>     # watch every product channel, capture new builds
 
 Diablo II: Resurrected is a trademark of Blizzard Entertainment. This project is
 unaffiliated and ships no game data.
+
+## See also
+
+[**blizzard-legacy-dl**](https://github.com/jaenster/blizzard-legacy-dl) — the same idea for the
+legacy games. Diablo II, StarCraft and Warcraft III are still served by the old BitTorrent-stub
+downloader, which fetches one numbered file per piece over HTTP rather than anything NGDP, so it
+is a separate tool.
