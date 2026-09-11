@@ -547,7 +547,7 @@ fn steamPass(a: std.mem.Allocator, root: ?*tact.Store, flags: Flags) !void {
 
     // A branch appearing, vanishing, losing its password or moving to a new build
     // all show up as a different digest.
-    const last = store.readText(a, try std.fmt.allocPrint(a, "{s}/state/branches", .{key_prefix})) catch "";
+    const last = try store.readText(a, try std.fmt.allocPrint(a, "{s}/state/branches", .{key_prefix}));
     if (!std.mem.eql(u8, last, digest)) {
         if (last.len == 0) {
             try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} first seen: {s}", .{ app.appid, digest }));
@@ -576,7 +576,7 @@ fn steamPass(a: std.mem.Allocator, root: ?*tact.Store, flags: Flags) !void {
 
     const pb_key = try std.fmt.allocPrint(a, "{s}/state/privatebranches", .{key_prefix});
     const pb_now = if (app.private_branches) "1" else "0";
-    const pb_last = store.readText(a, pb_key) catch "";
+    const pb_last = try store.readText(a, pb_key);
     if (pb_last.len != 0 and !std.mem.eql(u8, pb_last, pb_now))
         try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} private-branches flag {s} -> {s}", .{ app.appid, pb_last, pb_now }));
     try store.writeObject(a, pb_key, pb_now);
@@ -600,9 +600,12 @@ fn captureBinaries(a: std.mem.Allocator, cdn: *tact.Cdn, root: *tact.Store, prod
     if (wrote != 0) note("[watch] {s}: {d} binaries -> binaries/{s}-{s}/\n", .{ product, wrote, product, label });
 }
 
+/// An absent state object is "never seen"; an unreadable one is an error, because
+/// treating a failed read as "never seen" would alert about a build that is already
+/// recorded - and keep doing it every pass.
 fn readState(a: std.mem.Allocator, root: *tact.Store, product: []const u8, suffix: []const u8) ![]const u8 {
     const key = try std.fmt.allocPrint(a, "state/{s}{s}", .{ product, suffix });
-    return root.readText(a, key) catch "";
+    return root.readText(a, key);
 }
 
 fn writeState(a: std.mem.Allocator, root: *tact.Store, product: []const u8, suffix: []const u8, value: []const u8) !void {

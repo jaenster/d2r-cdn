@@ -138,22 +138,35 @@ pub const Bucket = struct {
 
     /// Size of `key`, or null when it does not exist.
     pub fn objectSize(self: *Bucket, key: []const u8) !?u64 {
-        var arena = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const s = try self.prepare(a, "HEAD", key, empty_sha256);
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            // Signed per attempt: a retry a second later needs its own x-amz-date.
+            const s = try self.prepare(a, "HEAD", key, empty_sha256);
 
-        var req = try self.client.request(.HEAD, try std.Uri.parse(s.url), .{
-            .extra_headers = &s.headers,
-            .headers = .{ .accept_encoding = .omit },
-        });
-        defer req.deinit();
-        try req.sendBodiless();
-        var redirect: [2048]u8 = undefined;
-        const res = try req.receiveHead(&redirect);
-        if (res.head.status == .not_found) return null;
-        if (res.head.status != .ok) return error.S3Status;
-        return res.head.content_length orelse 0;
+            var req = self.client.request(.HEAD, try std.Uri.parse(s.url), .{
+                .extra_headers = &s.headers,
+                .headers = .{ .accept_encoding = .omit },
+            }) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            defer req.deinit();
+            req.sendBodiless() catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            var redirect: [2048]u8 = undefined;
+            const res = req.receiveHead(&redirect) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            if (res.head.status == .not_found) return null;
+            if (res.head.status != .ok) return error.S3Status;
+            return res.head.content_length orelse 0;
+        }
     }
 
     /// `key`'s bytes, or null when it does not exist. `range` reads a slice.
@@ -161,29 +174,47 @@ pub const Bucket = struct {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const s = try self.prepare(a, "GET", key, empty_sha256);
 
-        var hdrs = std.array_list.Managed(http.Header).init(a);
-        try hdrs.appendSlice(&s.headers);
-        if (range) |r| try hdrs.append(.{
-            .name = "range",
-            .value = try std.fmt.allocPrint(a, "bytes={d}-{d}", .{ r.off, r.off + r.len - 1 }),
-        });
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            _ = arena.reset(.retain_capacity);
+            const s = try self.prepare(a, "GET", key, empty_sha256);
 
-        var req = try self.client.request(.GET, try std.Uri.parse(s.url), .{
-            .extra_headers = hdrs.items,
-            .headers = .{ .accept_encoding = .omit },
-        });
-        defer req.deinit();
-        try req.sendBodiless();
-        var redirect: [2048]u8 = undefined;
-        var res = try req.receiveHead(&redirect);
-        if (res.head.status == .not_found) return null;
-        if (res.head.status != .ok and res.head.status != .partial_content) return error.S3Status;
+            var hdrs = std.array_list.Managed(http.Header).init(a);
+            try hdrs.appendSlice(&s.headers);
+            if (range) |r| try hdrs.append(.{
+                .name = "range",
+                .value = try std.fmt.allocPrint(a, "bytes={d}-{d}", .{ r.off, r.off + r.len - 1 }),
+            });
 
-        var xfer: [64 * 1024]u8 = undefined;
-        const rdr = res.reader(&xfer);
-        return try rdr.allocRemaining(out, .unlimited);
+            var req = self.client.request(.GET, try std.Uri.parse(s.url), .{
+                .extra_headers = hdrs.items,
+                .headers = .{ .accept_encoding = .omit },
+            }) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            defer req.deinit();
+            req.sendBodiless() catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            var redirect: [2048]u8 = undefined;
+            var res = req.receiveHead(&redirect) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            if (res.head.status == .not_found) return null;
+            if (res.head.status != .ok and res.head.status != .partial_content) return error.S3Status;
+
+            var xfer: [64 * 1024]u8 = undefined;
+            const rdr = res.reader(&xfer);
+            const body = rdr.allocRemaining(out, .unlimited) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            return body;
+        }
     }
 
     /// Write `data` to `key`. For state files and manifests; a blob goes through
@@ -192,18 +223,32 @@ pub const Bucket = struct {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const s = try self.prepare(a, "PUT", key, &hexSha256(data));
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            _ = arena.reset(.retain_capacity);
+            const s = try self.prepare(a, "PUT", key, &hexSha256(data));
 
-        var req = try self.client.request(.PUT, try std.Uri.parse(s.url), .{
-            .extra_headers = &s.headers,
-            .headers = .{ .accept_encoding = .omit },
-        });
-        defer req.deinit();
-        const body = try a.dupe(u8, data);
-        try req.sendBodyComplete(body);
-        var redirect: [2048]u8 = undefined;
-        const res = try req.receiveHead(&redirect);
-        if (res.head.status != .ok and res.head.status != .created) return error.S3Status;
+            var req = self.client.request(.PUT, try std.Uri.parse(s.url), .{
+                .extra_headers = &s.headers,
+                .headers = .{ .accept_encoding = .omit },
+            }) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            defer req.deinit();
+            const body = try a.dupe(u8, data);
+            req.sendBodyComplete(body) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            var redirect: [2048]u8 = undefined;
+            const res = req.receiveHead(&redirect) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            if (res.head.status != .ok and res.head.status != .created) return error.S3Status;
+            return;
+        }
     }
 
     /// Begin a streamed PUT of exactly `len` bytes. `w` is initialised in place -
