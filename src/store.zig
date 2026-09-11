@@ -139,6 +139,38 @@ pub const Store = struct {
         return std.mem.trim(u8, data, " \n\r");
     }
 
+    /// Copy a local file into the store under `key`, streaming it so a multi-GB game
+    /// file never lands in memory. Returns the number of bytes stored.
+    pub fn putFile(self: *Store, a: std.mem.Allocator, key: []const u8, path: []const u8) !u64 {
+        const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
+        const size = (try file.stat(self.io)).size;
+
+        // A single PUT tops out at 5GiB; nothing in a game depot should come close,
+        // but failing with the reason beats failing with a status code.
+        if (std.meta.activeTag(self.where) == .bucket and size > 5 * 1024 * 1024 * 1024)
+            return error.ObjectTooLargeForSinglePut;
+
+        var w: ObjectWriter = undefined;
+        try self.beginWrite(&w, a, key, size, 0);
+        var ok = false;
+        defer if (!ok) w.abort();
+
+        var buf: [512 * 1024]u8 = undefined;
+        var off: u64 = 0;
+        while (off < size) {
+            const want: usize = @intCast(@min(@as(u64, buf.len), size - off));
+            const n = try file.readPositionalAll(self.io, buf[0..want], off);
+            if (n == 0) break;
+            try w.writer().writeAll(buf[0..n]);
+            off += n;
+        }
+        if (off != size) return error.ShortRead;
+        ok = true;
+        _ = try w.finish();
+        return size;
+    }
+
     /// Begin writing exactly `len` bytes to `key`, starting at byte `at` (a directory
     /// can resume a partial file; an object cannot, so a bucket requires `at == 0`).
     /// `w` is initialised in place and must not be moved afterwards.

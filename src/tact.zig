@@ -14,6 +14,8 @@ const http = std.http;
 const flate = std.compress.flate;
 pub const Md5 = std.crypto.hash.Md5;
 
+const log = std.log.scoped(.tact);
+
 pub const s3 = @import("s3.zig");
 pub const steam = @import("steam.zig");
 pub const store = @import("store.zig");
@@ -680,17 +682,29 @@ pub const Cdn = struct {
         const r = remote orelse {
             // With no advertised length a bucket cannot be written at all: a PUT has
             // to declare its size. A directory can still take the bytes.
-            if (dest.isBucket()) return .failed;
-            _ = self.stream(dest, key, url, 0, 0) catch return .failed;
+            if (dest.isBucket()) {
+                log.warn("{s}: no content-length from the CDN, cannot PUT", .{key});
+                return .failed;
+            }
+            _ = self.stream(dest, key, url, 0, 0) catch |err| {
+                log.warn("{s}: {s}", .{ key, @errorName(err) });
+                return .failed;
+            };
             return .downloaded;
         };
 
         const resume_at: u64 = if (!dest.isBucket() and have != 0 and have < r) have else 0;
-        const written = self.stream(dest, key, url, r, resume_at) catch return .failed;
+        const written = self.stream(dest, key, url, r, resume_at) catch |err| {
+            log.warn("{s}: have={d} remote={d} resume={d}: {s}", .{ key, have, r, resume_at, @errorName(err) });
+            return .failed;
+        };
         // The PUT declares its length, so a short body has already failed above.
         if (dest.isBucket()) return .downloaded;
         if (written == r) return if (resume_at != 0) .resumed else .downloaded;
-        if (resume_at == 0) return .failed;
+        if (resume_at == 0) {
+            log.warn("{s}: wrote {d} of {d} bytes", .{ key, written, r });
+            return .failed;
+        }
         return if ((self.stream(dest, key, url, r, 0) catch return .failed) == r) .downloaded else .failed;
     }
 

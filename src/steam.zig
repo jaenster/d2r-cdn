@@ -172,3 +172,70 @@ pub fn branchDigest(a: std.mem.Allocator, app: App) ![]u8 {
     });
     return out.toOwnedSlice();
 }
+
+// ---- capturing a build ---------------------------------------------------------
+
+/// How to reach DepotDownloader, and what it needs to log in.
+///
+/// The login token is not kept here: DepotDownloader stores it in .NET isolated
+/// storage under $HOME, so an unattended run needs the same HOME every time, and a
+/// first interactive login (Steam Guard) to put it there.
+pub const Login = struct {
+    /// Resolved on PATH unless it contains a '/'.
+    exe: []const u8 = "DepotDownloader",
+    /// Empty means anonymous, which only works for apps that allow it - not D2R.
+    username: []const u8 = "",
+    password: []const u8 = "",
+    /// For a branch behind a beta password.
+    branch_password: []const u8 = "",
+};
+
+/// One depot of one build, as it is being captured.
+pub const DepotJob = struct {
+    depot: []const u8,
+    manifest: []const u8,
+    branch: []const u8,
+};
+
+/// Run DepotDownloader for exactly one depot at one manifest, into `dir`.
+///
+/// Deliberately one depot per call rather than one app per call: the app-level
+/// download filters by the host's OS, architecture and language, which would
+/// silently skip most of D2R's depots. Enumerating depots from the PICS record and
+/// asking for each by id captures all of them, and lets each one be uploaded and
+/// deleted before the next starts, so the scratch disk only ever holds one depot.
+pub fn downloadDepot(
+    a: std.mem.Allocator,
+    io: std.Io,
+    login: Login,
+    appid: []const u8,
+    job: DepotJob,
+    dir: []const u8,
+) !void {
+    var argv = std.array_list.Managed([]const u8).init(a);
+    try argv.appendSlice(&.{
+        login.exe,
+        "-app",      appid,
+        "-depot",    job.depot,
+        "-manifest", job.manifest,
+        "-branch",   job.branch,
+        "-dir",      dir,
+        // Verify what is already on disk instead of trusting a partial run.
+        "-validate",
+    });
+    if (login.username.len != 0) {
+        try argv.appendSlice(&.{ "-username", login.username });
+        // With no password on the command line it uses the remembered token, which
+        // is what an unattended run wants.
+        if (login.password.len != 0) try argv.appendSlice(&.{ "-password", login.password });
+        try argv.append("-remember-password");
+    }
+    if (login.branch_password.len != 0) try argv.appendSlice(&.{ "-branchpassword", login.branch_password });
+
+    var child = try std.process.spawn(io, .{ .argv = argv.items });
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.DepotDownloadFailed,
+        else => return error.DepotDownloadFailed,
+    }
+}

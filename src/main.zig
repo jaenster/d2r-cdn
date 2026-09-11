@@ -149,6 +149,12 @@ pub fn main(init: std.process.Init) !void {
             flags.app = args.value(arg);
         } else if (std.mem.eql(u8, arg, "--branch")) {
             flags.branch = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--branchpassword")) {
+            flags.branch_password = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--scratch")) {
+            flags.scratch = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--depot")) {
+            flags.depot = args.value(arg);
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             fail("unknown option {s} (try --help)", .{arg});
         } else if (cmd.len == 0) {
@@ -169,6 +175,11 @@ pub fn main(init: std.process.Init) !void {
         .access_key = init.environ_map.get("AWS_ACCESS_KEY_ID") orelse "",
         .secret_key = init.environ_map.get("AWS_SECRET_ACCESS_KEY") orelse "",
     };
+
+    if (std.mem.eql(u8, cmd, "steam-capture")) {
+        const dest = if (rest.items.len > 0) rest.items[0] else fail("steam-capture needs a destination", .{});
+        return steamCapture(gpa, arena, opts, dest, flags, init.environ_map);
+    }
 
     if (std.mem.eql(u8, cmd, "steam")) {
         return steamWatch(gpa, arena, opts, if (rest.items.len > 0) rest.items[0] else null, flags);
@@ -239,6 +250,9 @@ const Flags = struct {
     products: ?[]const u8 = null,
     app: []const u8 = tact.steam.d2r_appid,
     branch: []const u8 = "public",
+    branch_password: []const u8 = "",
+    scratch: []const u8 = "./steam-scratch",
+    depot: ?[]const u8 = null,
 };
 
 // ---- commands ------------------------------------------------------------------
@@ -603,6 +617,107 @@ fn captureBinaries(a: std.mem.Allocator, cdn: *tact.Cdn, root: *tact.Store, prod
 /// An absent state object is "never seen"; an unreadable one is an error, because
 /// treating a failed read as "never seen" would alert about a build that is already
 /// recorded - and keep doing it every pass.
+/// Capture a Steam build: every depot of a branch, downloaded one at a time and
+/// uploaded as it completes, so the scratch disk only ever holds one depot.
+///
+/// Depot bytes need an account that owns the app - Steam issues depot keys only after
+/// an ownership check - so unlike the rest of this tool, this half cannot run
+/// anonymously. The login token lives in DepotDownloader's isolated storage under
+/// $HOME, so an unattended run needs a persistent HOME and one interactive login
+/// first to satisfy Steam Guard.
+fn steamCapture(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.Options, dest: []const u8, flags: Flags, env: *const std.process.Environ.Map) !void {
+    const store = tact.Store.open(arena, io_, dest, base_opts.s3) catch |err| fail("{s}: {s}", .{ dest, @errorName(err) });
+    defer store.close();
+
+    const login: tact.steam.Login = .{
+        .exe = env.get("DEPOTDOWNLOADER") orelse "DepotDownloader",
+        .username = env.get("STEAM_USERNAME") orelse "",
+        .password = env.get("STEAM_PASSWORD") orelse "",
+        .branch_password = flags.branch_password,
+    };
+
+    const app = try tact.steam.fetchApp(arena, io_, flags.app, flags.branch);
+    const br = app.branch(flags.branch) orelse fail("app {s} has no branch '{s}'", .{ flags.app, flags.branch });
+    note("[capture] {s} branch {s} build {s}: {d} depots, {d:.1} GB\n", .{ app.name, br.name, br.build_id, app.depots.len, gb(app.totalSize()) });
+
+    var done: usize = 0;
+    var bytes: u64 = 0;
+    var failed: usize = 0;
+    for (app.depots) |d| {
+        if (d.manifest.len == 0) continue; // no content on this branch
+        if (flags.depot) |only| if (!std.mem.eql(u8, only, d.id)) continue;
+
+        var pass = std.heap.ArenaAllocator.init(gpa);
+        defer pass.deinit();
+        const a = pass.allocator();
+
+        // The marker holds the manifest id, so a depot re-published under the same
+        // build is captured again rather than skipped.
+        const marker = try std.fmt.allocPrint(a, "steam/{s}/state/captured-{s}-{s}-{s}", .{ app.appid, br.name, br.build_id, d.id });
+        if (std.mem.eql(u8, try store.readText(a, marker), d.manifest)) {
+            note("[capture] depot {s}: already captured\n", .{d.id});
+            continue;
+        }
+
+        const dir = try std.fmt.allocPrint(a, "{s}/{s}-{s}", .{ flags.scratch, app.appid, d.id });
+        note("[capture] depot {s} manifest {s} ({d:.1} GB) -> {s}\n", .{ d.id, d.manifest, gb(d.size), dir });
+        tact.steam.downloadDepot(a, io_, login, app.appid, .{
+            .depot = d.id,
+            .manifest = d.manifest,
+            .branch = br.name,
+        }, dir) catch |err| {
+            note("[capture] depot {s}: {s}\n", .{ d.id, @errorName(err) });
+            try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} depot {s} DOWNLOAD FAILED ({s})", .{ app.appid, d.id, @errorName(err) }));
+            failed += 1;
+            continue;
+        };
+
+        const prefix = try std.fmt.allocPrint(a, "steam/{s}/{s}/{s}/{s}", .{ app.appid, br.name, br.build_id, d.id });
+        const n = uploadTree(a, store, dir, prefix) catch |err| {
+            note("[capture] depot {s}: upload: {s}\n", .{ d.id, @errorName(err) });
+            failed += 1;
+            continue;
+        };
+        bytes += n;
+        done += 1;
+
+        // Only once the bytes are safely in the store: the scratch copy is the only
+        // other copy until then.
+        std.Io.Dir.cwd().deleteTree(io_, dir) catch |err| note("[capture] depot {s}: scratch not removed: {s}\n", .{ d.id, @errorName(err) });
+        try store.writeObject(a, marker, d.manifest);
+        note("[capture] depot {s}: {d:.1} GB stored\n", .{ d.id, gb(n) });
+    }
+
+    const msg = try std.fmt.allocPrint(arena, "STEAM {s} branch {s} build {s}: {d} depots captured ({d:.1} GB), {d} failed", .{ app.appid, br.name, br.build_id, done, gb(bytes), failed });
+    if (done != 0 or failed != 0) try alert(arena, flags.webhook, msg) else note("[capture] nothing to do\n", .{});
+    if (failed != 0) return error.CaptureIncomplete;
+}
+
+/// Copy every file under `dir` into the store beneath `prefix`, keeping the tree.
+fn uploadTree(a: std.mem.Allocator, store: *tact.Store, dir: []const u8, prefix: []const u8) !u64 {
+    var d = try std.Io.Dir.cwd().openDir(io_, dir, .{ .iterate = true });
+    defer d.close(io_);
+    var it = try d.walk(a);
+    defer it.deinit();
+
+    var total: u64 = 0;
+    var files: usize = 0;
+    while (try it.next(io_)) |e| {
+        if (e.kind != .file) continue;
+        // DepotDownloader's own bookkeeping, not game content.
+        if (std.mem.startsWith(u8, e.path, ".DepotDownloader")) continue;
+
+        const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, e.path });
+        defer a.free(key);
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, e.path });
+        defer a.free(path);
+        total += try store.putFile(a, key, path);
+        files += 1;
+        if (files % 200 == 0) note("  {d} files, {d:.1} GB\n", .{ files, gb(total) });
+    }
+    return total;
+}
+
 fn readState(a: std.mem.Allocator, root: *tact.Store, product: []const u8, suffix: []const u8) ![]const u8 {
     const key = try std.fmt.allocPrint(a, "state/{s}{s}", .{ product, suffix });
     return root.readText(a, key);
