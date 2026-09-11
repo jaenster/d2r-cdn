@@ -470,8 +470,18 @@ fn scanProduct(gpa: std.mem.Allocator, a: std.mem.Allocator, base_opts: tact.Opt
             \\{{"product":"{s}","version":"{s}","region":"{s}","build_config":"{s}","cdn_config":"{s}","encrypted":{s},"key_name":"{s}","ts":"{s}"}}
             \\
         , .{ product, cdn.version, cdn.region, cdn.build_config, cdn.cdn_config, if (enc) "true" else "false", key, try isoNow(a) });
-        const jkey = try std.fmt.allocPrint(a, "builds/{s}/{s}.json", .{ product, if (cdn.version.len != 0) cdn.version else cdn.build_config });
+        const label = if (cdn.version.len != 0) cdn.version else cdn.build_config;
+        const jkey = try std.fmt.allocPrint(a, "builds/{s}/{s}.json", .{ product, label });
         try root.writeObject(a, jkey, json);
+
+        // The versions/cdns rows are what make a build reconstructible later: the CDN
+        // stops serving them once the build rotates out, and without them the blobs
+        // are an unindexed heap.
+        for ([_][]const u8{ "versions", "cdns" }) |endpoint| {
+            const table = cdn.service(endpoint) catch continue;
+            const tkey = try std.fmt.allocPrint(a, "builds/{s}/{s}.{s}", .{ product, label, endpoint });
+            root.writeObject(a, tkey, table) catch {};
+        }
         try writeState(a, root, product, "", cdn.build_config);
     }
 
