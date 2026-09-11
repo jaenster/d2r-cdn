@@ -166,6 +166,8 @@ pub fn main(init: std.process.Init) !void {
             flags.scratch = args.value(arg);
         } else if (std.mem.eql(u8, arg, "--depot")) {
             flags.depot = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--manifest")) {
+            flags.manifest = args.value(arg);
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             fail("unknown option {s} (try --help)", .{arg});
         } else if (cmd.len == 0) {
@@ -266,6 +268,7 @@ const Flags = struct {
     files: ?[]const u8 = null,
     scratch: []const u8 = "./steam-scratch",
     depot: ?[]const u8 = null,
+    manifest: ?[]const u8 = null,
 };
 
 // ---- commands ------------------------------------------------------------------
@@ -686,6 +689,20 @@ fn steamCapture(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tac
 }
 
 fn captureApp(gpa: std.mem.Allocator, arena: std.mem.Allocator, store: *tact.Store, login: tact.steam.Login, appid: []const u8, flags: Flags) !void {
+    // An explicit manifest is a build PICS no longer lists - the only way to reach
+    // one of Steam's older builds, since the record only ever names what is current.
+    // It is stored under the manifest id, because that is the only name it has.
+    if (flags.manifest) |gid| {
+        const depot = flags.depot orelse fail("--manifest needs --depot", .{});
+        const label = try std.fmt.allocPrint(arena, "manifest-{s}", .{gid});
+        return captureDepot(gpa, arena, store, login, appid, flags, .{
+            .depot = depot,
+            .manifest = gid,
+            .branch = flags.branch,
+            .files = flags.files,
+        }, label, 0);
+    }
+
     const app = try tact.steam.fetchApp(arena, io_, appid, flags.branch);
     const br = app.branch(flags.branch) orelse return error.NoSuchBranch;
     note("[capture] {s} branch {s} build {s}: {d} depots, {d:.1} GB{s}\n", .{
@@ -694,56 +711,78 @@ fn captureApp(gpa: std.mem.Allocator, arena: std.mem.Allocator, store: *tact.Sto
     });
 
     var done: usize = 0;
-    var bytes: u64 = 0;
     var failed: usize = 0;
     for (app.depots) |d| {
         if (d.manifest.len == 0) continue; // no content on this branch
         if (flags.depot) |only| if (!std.mem.eql(u8, only, d.id)) continue;
-
-        var pass = std.heap.ArenaAllocator.init(gpa);
-        defer pass.deinit();
-        const a = pass.allocator();
-
-        // The marker holds the manifest id, so a depot republished under the same
-        // build is captured again rather than skipped.
-        const marker = try std.fmt.allocPrint(a, "steam/{s}/state/captured-{s}-{s}-{s}", .{ app.appid, br.name, br.build_id, d.id });
-        if (std.mem.eql(u8, try store.readText(a, marker), d.manifest)) continue;
-
-        const dir = try std.fmt.allocPrint(a, "{s}/{s}-{s}", .{ flags.scratch, app.appid, d.id });
-        note("[capture] depot {s} manifest {s} ({d:.1} GB declared) -> {s}\n", .{ d.id, d.manifest, gb(d.size), dir });
-        tact.steam.downloadDepot(a, io_, login, app.appid, .{
+        captureDepot(gpa, arena, store, login, app.appid, flags, .{
             .depot = d.id,
             .manifest = d.manifest,
             .branch = br.name,
             .files = flags.files,
-        }, dir) catch |err| {
-            note("[capture] depot {s}: {s}\n", .{ d.id, @errorName(err) });
-            try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} depot {s} DOWNLOAD FAILED ({s})", .{ app.appid, d.id, @errorName(err) }));
+        }, br.build_id, d.size) catch {
             failed += 1;
             continue;
         };
-
-        const prefix = try std.fmt.allocPrint(a, "steam/{s}/{s}/{s}/{s}", .{ app.appid, br.name, br.build_id, d.id });
-        const n = uploadTree(a, store, dir, prefix) catch |err| {
-            note("[capture] depot {s}: upload: {s}\n", .{ d.id, @errorName(err) });
-            failed += 1;
-            continue;
-        };
-        bytes += n;
         done += 1;
-
-        // Only once the bytes are safely in the store: the scratch copy is the only
-        // other copy until then.
-        std.Io.Dir.cwd().deleteTree(io_, dir) catch |err| note("[capture] depot {s}: scratch not removed: {s}\n", .{ d.id, @errorName(err) });
-        try store.writeObject(a, marker, d.manifest);
     }
 
     if (done != 0 or failed != 0) {
-        try alert(arena, flags.webhook, try std.fmt.allocPrint(arena, "STEAM {s} ({s}) build {s}: {d} depots captured ({d:.1} MB), {d} failed", .{
-            app.appid, app.name, br.build_id, done, mb(bytes), failed,
+        try alert(arena, flags.webhook, try std.fmt.allocPrint(arena, "STEAM {s} ({s}) build {s}: {d} depots captured, {d} failed", .{
+            app.appid, app.name, br.build_id, done, failed,
         }));
     }
     if (failed != 0) return error.CaptureIncomplete;
+}
+
+/// Download one depot at one manifest and put it in the store under
+/// `steam/<app>/<branch>/<label>/<depot>/`. `label` is the build id for a current
+/// build, or `manifest-<gid>` for an older one PICS no longer names.
+///
+/// The marker holds the manifest id, so a depot republished under the same label is
+/// captured again rather than skipped, and a half-finished run resumes at the depot
+/// it stopped on.
+fn captureDepot(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    store: *tact.Store,
+    login: tact.steam.Login,
+    appid: []const u8,
+    flags: Flags,
+    job: tact.steam.DepotJob,
+    label: []const u8,
+    declared: u64,
+) !void {
+    var pass = std.heap.ArenaAllocator.init(gpa);
+    defer pass.deinit();
+    const a = pass.allocator();
+    _ = arena;
+
+    const marker = try std.fmt.allocPrint(a, "steam/{s}/state/captured-{s}-{s}-{s}", .{ appid, job.branch, label, job.depot });
+    if (std.mem.eql(u8, try store.readText(a, marker), job.manifest)) return;
+
+    const dir = try std.fmt.allocPrint(a, "{s}/{s}-{s}", .{ flags.scratch, appid, job.depot });
+    note("[capture] depot {s} manifest {s}", .{ job.depot, job.manifest });
+    if (declared != 0) note(" ({d:.1} GB declared)", .{gb(declared)});
+    note(" -> {s}/{s}\n", .{ label, job.depot });
+
+    tact.steam.downloadDepot(a, io_, login, appid, job, dir) catch |err| {
+        note("[capture] depot {s}: {s}\n", .{ job.depot, @errorName(err) });
+        try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} depot {s} ({s}) DOWNLOAD FAILED ({s})", .{ appid, job.depot, label, @errorName(err) }));
+        return err;
+    };
+
+    const prefix = try std.fmt.allocPrint(a, "steam/{s}/{s}/{s}/{s}", .{ appid, job.branch, label, job.depot });
+    const n = uploadTree(a, store, dir, prefix) catch |err| {
+        note("[capture] depot {s}: upload: {s}\n", .{ job.depot, @errorName(err) });
+        return err;
+    };
+
+    // Only once the bytes are safely in the store: the scratch copy is the only other
+    // copy until then.
+    std.Io.Dir.cwd().deleteTree(io_, dir) catch |err| note("[capture] depot {s}: scratch not removed: {s}\n", .{ job.depot, @errorName(err) });
+    try store.writeObject(a, marker, job.manifest);
+    note("[capture] depot {s}: {d:.1} MB stored under {s}\n", .{ job.depot, mb(n), label });
 }
 
 /// Copy every file under `dir` into the store beneath `prefix`, keeping the tree.
