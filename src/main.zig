@@ -17,18 +17,22 @@ const usage =
     \\  list [pattern] [--root]    install manifest (--root: the whole file catalog)
     \\  fetch <name>...            extract install files (D2R.exe, *.dll) by name
     \\  extract [pattern]...       extract game files by root path (default: all)
-    \\  mirror <dir> [--indices]   mirror the build's blobs into a pool dir, resumable
-    \\  watch <dir>                poll every product channel, capture new builds
+    \\  mirror <dest> [--indices]  mirror the build's blobs into a pool, resumable
+    \\  watch <dest>               poll every product channel, capture new builds
+    \\  steam [<dest>]             poll the Steam branch table (no login needed)
     \\
     \\options:
     \\  -p, --product <code>   product code (default osi; osib=beta, osit=test)
     \\  -r, --region <code>    region row (default us; eu, kr, cn)
     \\      --patch-host <h>   version service host (default us.patch.battle.net)
     \\      --cdn-host <h>     force a CDN host (e.g. level3.blizzard.com)
-    \\      --pool <dir>       read blobs from this local mirror before the network
+    \\      --pool <dest>      read blobs from this mirror before the network
     \\      --cache            also write fetched blobs into --pool
     \\  -o, --out <path>       output directory (fetch/extract) or file ("-" = stdout)
     \\  -q, --quiet            no progress on stderr
+    \\
+    \\a <dest> is a directory or s3://<bucket>/<prefix>; a bucket reads S3_ENDPOINT,
+    \\S3_REGION, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from the environment
     \\
     \\command options:
     \\  mirror   --indices     archive indices only, skip the 256MB archives
@@ -37,6 +41,9 @@ const usage =
     \\           --dry-run     list what would be written, extract nothing
     \\  watch    --interval <s>  loop every s seconds (default: one pass and exit)
     \\           --data          mirror the full build when a new one appears
+    \\  steam    --app <id>      Steam appid (default 2536520, D2R Infernal Edition)
+    \\           --branch <name> which branch's manifest ids to report (default public)
+    \\           --interval <s>  loop every s seconds
     \\           --webhook <url> Discord webhook (or $DISCORD_WEBHOOK)
     \\           --products <l>  space-separated codes (default: known + brute force)
     \\
@@ -47,6 +54,7 @@ const usage =
     \\  d2r-cdn --pool /data/pool extract -o /data/game
     \\  d2r-cdn mirror /data/pool --indices
     \\  d2r-cdn watch /data --interval 60 --data
+    \\  d2r-cdn steam s3://bucket/d2r --interval 900
     \\
 ;
 
@@ -137,6 +145,10 @@ pub fn main(init: std.process.Init) !void {
             flags.webhook = args.value(arg);
         } else if (std.mem.eql(u8, arg, "--products")) {
             flags.products = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--app")) {
+            flags.app = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--branch")) {
+            flags.branch = args.value(arg);
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             fail("unknown option {s} (try --help)", .{arg});
         } else if (cmd.len == 0) {
@@ -150,6 +162,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (flags.webhook == null) flags.webhook = init.environ_map.get("DISCORD_WEBHOOK");
+    // A bucket pool needs a service and keys; the command line never carries secrets.
+    opts.s3 = .{
+        .host = init.environ_map.get("S3_ENDPOINT") orelse init.environ_map.get("AWS_ENDPOINT_URL") orelse "",
+        .region = init.environ_map.get("S3_REGION") orelse init.environ_map.get("AWS_REGION") orelse "us-east-1",
+        .access_key = init.environ_map.get("AWS_ACCESS_KEY_ID") orelse "",
+        .secret_key = init.environ_map.get("AWS_SECRET_ACCESS_KEY") orelse "",
+    };
+
+    if (std.mem.eql(u8, cmd, "steam")) {
+        return steamWatch(gpa, arena, opts, if (rest.items.len > 0) rest.items[0] else null, flags);
+    }
 
     // watch drives its own clients, one per product channel
     if (std.mem.eql(u8, cmd, "watch")) {
@@ -193,8 +216,10 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "extract")) {
         try extract(arena, cdn, rest.items, out_path orelse "extracted", flags);
     } else if (std.mem.eql(u8, cmd, "mirror")) {
-        const dir = if (rest.items.len > 0) rest.items[0] else out_path orelse fail("mirror needs a destination directory", .{});
-        _ = try mirror(cdn, dir, flags);
+        const spec = if (rest.items.len > 0) rest.items[0] else out_path orelse fail("mirror needs a destination", .{});
+        const dest = tact.Store.open(arena, io_, spec, opts.s3) catch |err| fail("pool {s}: {s}", .{ spec, @errorName(err) });
+        defer dest.close();
+        _ = try mirror(cdn, dest, flags);
     } else {
         fail("unknown command '{s}' (try --help)", .{cmd});
     }
@@ -212,6 +237,8 @@ const Flags = struct {
     interval: u32 = 0,
     webhook: ?[]const u8 = null,
     products: ?[]const u8 = null,
+    app: []const u8 = tact.steam.d2r_appid,
+    branch: []const u8 = "public",
 };
 
 // ---- commands ------------------------------------------------------------------
@@ -343,10 +370,10 @@ fn extract(gpa: std.mem.Allocator, cdn: *tact.Cdn, patterns: []const []const u8,
     if (!flags.dry_run) note("[extract] done: {d} written ({d:.1} MB), {d} already there, {d} failed\n", .{ wrote, mb(bytes), have, failed });
 }
 
-fn mirror(cdn: *tact.Cdn, dest: []const u8, flags: Flags) !u64 {
+fn mirror(cdn: *tact.Cdn, dest: *tact.Store, flags: Flags) !u64 {
     const blobs = try cdn.blobs(cdn.gpa, .{ .indices_only = flags.indices, .max_archives = flags.max });
     defer cdn.gpa.free(blobs);
-    note("[mirror] {s} build {s} -> {s}  ({d} blobs)\n", .{ cdn.opts.product, cdn.version, dest, blobs.len });
+    note("[mirror] {s} build {s} -> {s}  ({d} blobs)\n", .{ cdn.opts.product, cdn.version, dest.spec, blobs.len });
 
     var got: u64 = 0;
     var failed: usize = 0;
@@ -377,7 +404,7 @@ fn mirror(cdn: *tact.Cdn, dest: []const u8, flags: Flags) !u64 {
 const known_products = [_][]const u8{ "osi", "osit", "osic", "osib", "osia", "osidev", "osiv1", "osiv2", "osiv3", "osiv4", "osiv5", "osiv6" };
 const extra_products = [_][]const u8{ "osiqa", "osistage", "osiptr", "osiinternal", "osicert", "osivendor", "osidemo", "osilive", "osipatch" };
 
-fn watch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.Options, dir: []const u8, flags: Flags) !void {
+fn watch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.Options, spec: []const u8, flags: Flags) !void {
     var products = std.array_list.Managed([]const u8).init(arena);
     if (flags.products) |list_| {
         var it = std.mem.tokenizeAny(u8, list_, " ,");
@@ -388,27 +415,32 @@ fn watch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.Optio
         // brute space: osia..osiz, catches a code Blizzard adds without telling anyone
         for ('a'..'z' + 1) |c| try products.append(try std.fmt.allocPrint(arena, "osi{c}", .{@as(u8, @intCast(c))}));
     }
-    const state_dir = try std.fmt.allocPrint(arena, "{s}/state", .{dir});
-    const pool = try std.fmt.allocPrint(arena, "{s}/pool", .{dir});
-    try std.Io.Dir.cwd().createDirPath(io_, state_dir);
 
-    note("[watch] {d} product channels -> {s}\n", .{ products.items.len, dir });
+    // The channel history and the blobs live in the same place, one prefix apart -
+    // a directory on this machine or a bucket, decided by `spec` alone.
+    const root = tact.Store.open(arena, io_, spec, base_opts.s3) catch |err| fail("{s}: {s}", .{ spec, @errorName(err) });
+    defer root.close();
+    const pool_spec = try std.fmt.allocPrint(arena, "{s}/pool", .{std.mem.trimEnd(u8, spec, "/")});
+    const pool = tact.Store.open(arena, io_, pool_spec, base_opts.s3) catch |err| fail("{s}: {s}", .{ pool_spec, @errorName(err) });
+    defer pool.close();
+
+    note("[watch] {d} product channels -> {s}\n", .{ products.items.len, root.spec });
     var pass_arena = std.heap.ArenaAllocator.init(gpa);
     defer pass_arena.deinit();
     while (true) {
         for (products.items) |p| {
-            scanProduct(gpa, pass_arena.allocator(), base_opts, p, dir, state_dir, pool, flags) catch |err| switch (err) {
+            scanProduct(gpa, pass_arena.allocator(), base_opts, p, root, pool, flags) catch |err| switch (err) {
                 error.NoBuild, error.HttpStatus, error.NoCdnRow => {},
                 else => note("[watch] {s}: {s}\n", .{ p, @errorName(err) }),
             };
         }
         if (flags.interval == 0) return;
-        _ = pass_arena.reset(.retain_capacity); // a pass leaves nothing behind but state files
+        _ = pass_arena.reset(.retain_capacity); // a pass leaves nothing behind but state
         try io_.sleep(.fromMilliseconds(@as(i64, flags.interval) * 1000), .awake);
     }
 }
 
-fn scanProduct(gpa: std.mem.Allocator, a: std.mem.Allocator, base_opts: tact.Options, product: []const u8, dir: []const u8, state_dir: []const u8, pool: []const u8, flags: Flags) !void {
+fn scanProduct(gpa: std.mem.Allocator, a: std.mem.Allocator, base_opts: tact.Options, product: []const u8, root: *tact.Store, pool: *tact.Store, flags: Flags) !void {
     var opts = base_opts;
     opts.product = product;
     const cdn = try tact.Cdn.open(gpa, io_, opts);
@@ -421,12 +453,12 @@ fn scanProduct(gpa: std.mem.Allocator, a: std.mem.Allocator, base_opts: tact.Opt
 
     // A confirmed encrypted -> plaintext transition is the interesting event: an
     // internal channel that just became readable.
-    const enc_state = try readState(a, state_dir, product, ".enc");
+    const enc_state = try readState(a, root, product, ".enc");
     if (std.mem.eql(u8, enc_state, "1") and !enc)
         try alert(a, flags.webhook, try std.fmt.allocPrint(a, "@@@ {s} WENT PLAINTEXT (was encrypted) - {s} - POSSIBLE INTERNAL LEAK @@@", .{ product, cdn.version }));
-    try writeState(state_dir, product, ".enc", if (enc) "1" else "0");
+    try writeState(a, root, product, ".enc", if (enc) "1" else "0");
 
-    const last = try readState(a, state_dir, product, "");
+    const last = try readState(a, root, product, "");
     if (!std.mem.eql(u8, last, cdn.build_config)) {
         const msg = if (last.len == 0)
             try std.fmt.allocPrint(a, "NEW PRODUCT {s}: {s} [{s}]{s}{s} ({s})", .{ product, cdn.version, tag, if (key.len != 0) " needs-key=" else "", key, cdn.region })
@@ -434,44 +466,114 @@ fn scanProduct(gpa: std.mem.Allocator, a: std.mem.Allocator, base_opts: tact.Opt
             try std.fmt.allocPrint(a, "{s} NEW BUILD: {s} [{s}]{s}{s} ({s})", .{ product, cdn.version, tag, if (key.len != 0) " needs-key=" else "", key, cdn.region });
         try alert(a, flags.webhook, msg);
 
-        const bdir = try std.fmt.allocPrint(a, "{s}/builds/{s}", .{ dir, product });
-        try std.Io.Dir.cwd().createDirPath(io_, bdir);
         const json = try std.fmt.allocPrint(a,
             \\{{"product":"{s}","version":"{s}","region":"{s}","build_config":"{s}","cdn_config":"{s}","encrypted":{s},"key_name":"{s}","ts":"{s}"}}
             \\
         , .{ product, cdn.version, cdn.region, cdn.build_config, cdn.cdn_config, if (enc) "true" else "false", key, try isoNow(a) });
-        const jpath = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ bdir, if (cdn.version.len != 0) cdn.version else cdn.build_config });
-        try std.Io.Dir.cwd().writeFile(io_, .{ .sub_path = jpath, .data = json });
-        try writeState(state_dir, product, "", cdn.build_config);
+        const jkey = try std.fmt.allocPrint(a, "builds/{s}/{s}.json", .{ product, if (cdn.version.len != 0) cdn.version else cdn.build_config });
+        try root.writeObject(a, jkey, json);
+        try writeState(a, root, product, "", cdn.build_config);
     }
 
     // Capture the build itself. Encrypted channels have no readable archive list, so
     // only the configs are worth keeping there.
     if (flags.data and !enc) {
-        const done = try readState(a, state_dir, product, ".data");
+        const done = try readState(a, root, product, ".data");
         if (!std.mem.eql(u8, done, cdn.build_config)) {
             try alert(a, flags.webhook, try std.fmt.allocPrint(a, "{s} DOWNLOADING {s} ...", .{ product, cdn.version }));
             const n = mirror(cdn, pool, flags) catch {
                 try alert(a, flags.webhook, try std.fmt.allocPrint(a, "{s} download FAILED {s} (will retry)", .{ product, cdn.version }));
                 return;
             };
-            try writeState(state_dir, product, ".data", cdn.build_config);
+            try writeState(a, root, product, ".data", cdn.build_config);
             try alert(a, flags.webhook, try std.fmt.allocPrint(a, "{s} DONE {s} ({d} new blobs)", .{ product, cdn.version, n }));
         }
     }
 }
 
-fn readState(gpa: std.mem.Allocator, state_dir: []const u8, product: []const u8, suffix: []const u8) ![]const u8 {
-    const path = try std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ state_dir, product, suffix });
-    defer gpa.free(path);
-    const data = std.Io.Dir.cwd().readFileAlloc(io_, path, gpa, .limited(256)) catch return "";
-    return std.mem.trim(u8, data, " \n\r");
+// ---- steam ---------------------------------------------------------------------
+
+fn steamWatch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.Options, spec: ?[]const u8, flags: Flags) !void {
+    // No destination: just report what Steam is serving right now.
+    const root: ?*tact.Store = if (spec) |sp|
+        tact.Store.open(arena, io_, sp, base_opts.s3) catch |err| fail("{s}: {s}", .{ sp, @errorName(err) })
+    else
+        null;
+    defer if (root) |r| r.close();
+
+    var pass_arena = std.heap.ArenaAllocator.init(gpa);
+    defer pass_arena.deinit();
+    while (true) {
+        steamPass(pass_arena.allocator(), root, flags) catch |err|
+            note("[steam] {s}\n", .{@errorName(err)});
+        if (flags.interval == 0) return;
+        _ = pass_arena.reset(.retain_capacity);
+        try io_.sleep(.fromMilliseconds(@as(i64, flags.interval) * 1000), .awake);
+    }
 }
 
-fn writeState(state_dir: []const u8, product: []const u8, suffix: []const u8, value: []const u8) !void {
-    var buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buf, "{s}/{s}{s}", .{ state_dir, product, suffix });
-    try std.Io.Dir.cwd().writeFile(io_, .{ .sub_path = path, .data = value });
+fn steamPass(a: std.mem.Allocator, root: ?*tact.Store, flags: Flags) !void {
+    const app = try tact.steam.fetchApp(a, io_, flags.app, flags.branch);
+
+    note("[steam] {s} ({s}) - {d} branches, {d} depots, {d:.1} GB on {s}{s}\n", .{
+        app.name,               app.appid, app.branches.len, app.depots.len,
+        gb(app.totalSize()), flags.branch, if (app.private_branches) ", has private branches" else "",
+    });
+    for (app.branches) |b| note("  {s:<16} build {s:<10}{s}{s} {s}\n", .{
+        b.name,                                 b.build_id,
+        if (b.password_required) " [pwd]" else "", if (b.lcs_required) " [lcs]" else "",
+        b.description,
+    });
+
+    const store = root orelse return;
+    const digest = try tact.steam.branchDigest(a, app);
+    const key_prefix = try std.fmt.allocPrint(a, "steam/{s}", .{app.appid});
+
+    // A branch appearing, vanishing, losing its password or moving to a new build
+    // all show up as a different digest.
+    const last = store.readText(a, try std.fmt.allocPrint(a, "{s}/state/branches", .{key_prefix})) catch "";
+    if (!std.mem.eql(u8, last, digest)) {
+        if (last.len == 0) {
+            try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} first seen: {s}", .{ app.appid, digest }));
+        } else {
+            try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} BRANCHES CHANGED\nwas: {s}\nnow: {s}", .{ app.appid, last, digest }));
+            // A branch nobody had seen before is the one worth shouting about.
+            for (app.branches) |b| {
+                const needle = try std.fmt.allocPrint(a, "{s}=", .{b.name});
+                if (std.mem.indexOf(u8, last, needle) == null)
+                    try alert(a, flags.webhook, try std.fmt.allocPrint(a, "@@@ STEAM {s} NEW BRANCH '{s}' build {s}{s} @@@", .{
+                        app.appid, b.name,             b.build_id,
+                        if (b.password_required) " (password protected)" else if (b.lcs_required) " (local content server)" else " - OPEN",
+                    }));
+            }
+        }
+
+        // The record as served is the archive: manifest ids stay fetchable from Steam
+        // long after the branch has moved on, so keeping them keeps the build.
+        for (app.branches) |b| {
+            const jkey = try std.fmt.allocPrint(a, "{s}/builds/{s}-{s}.json", .{ key_prefix, b.name, b.build_id });
+            if ((store.objectSize(a, jkey) catch null) != null) continue;
+            try store.writeObject(a, jkey, app.raw);
+        }
+        try store.writeObject(a, try std.fmt.allocPrint(a, "{s}/state/branches", .{key_prefix}), digest);
+    }
+
+    const pb_key = try std.fmt.allocPrint(a, "{s}/state/privatebranches", .{key_prefix});
+    const pb_now = if (app.private_branches) "1" else "0";
+    const pb_last = store.readText(a, pb_key) catch "";
+    if (pb_last.len != 0 and !std.mem.eql(u8, pb_last, pb_now))
+        try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} private-branches flag {s} -> {s}", .{ app.appid, pb_last, pb_now }));
+    try store.writeObject(a, pb_key, pb_now);
+}
+
+fn readState(a: std.mem.Allocator, root: *tact.Store, product: []const u8, suffix: []const u8) ![]const u8 {
+    const key = try std.fmt.allocPrint(a, "state/{s}{s}", .{ product, suffix });
+    return root.readText(a, key) catch "";
+}
+
+fn writeState(a: std.mem.Allocator, root: *tact.Store, product: []const u8, suffix: []const u8, value: []const u8) !void {
+    const key = try std.fmt.allocPrint(a, "state/{s}{s}", .{ product, suffix });
+    try root.writeObject(a, key, value);
 }
 
 fn alert(gpa: std.mem.Allocator, webhook: ?[]const u8, msg: []const u8) !void {
@@ -506,6 +608,10 @@ fn isoNow(gpa: std.mem.Allocator) ![]const u8 {
 }
 
 // ---- helpers -------------------------------------------------------------------
+
+fn gb(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
+}
 
 fn mb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1e6;

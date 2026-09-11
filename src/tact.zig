@@ -1,7 +1,8 @@
 //! tact - a small, dependency-free Zig library for Blizzard's modern CDN
 //! (NGDP / TACT / CASC). Resolve a product's current build, decode BLTE, walk the
 //! encoding / root / install manifests, pull individual files out of the data
-//! archives by content hash, and mirror a build to a local content-addressed pool.
+//! archives by content hash, and mirror a build to a content-addressed pool - a
+//! directory or an S3 bucket, same code either way.
 //! Pure std (`std.http`, `std.compress.flate`, `Md5`).
 //!
 //! Typical use:
@@ -12,6 +13,12 @@ const std = @import("std");
 const http = std.http;
 const flate = std.compress.flate;
 pub const Md5 = std.crypto.hash.Md5;
+
+pub const s3 = @import("s3.zig");
+pub const steam = @import("steam.zig");
+pub const store = @import("store.zig");
+pub const Store = store.Store;
+pub const ObjectWriter = store.ObjectWriter;
 
 pub const Hash = [16]u8;
 
@@ -152,6 +159,13 @@ pub fn hexHash(h: Hash) [32]u8 {
     return std.fmt.bytesToHex(h, .lower);
 }
 
+/// Where a blob lives inside a pool: `<kind>/ab/cd/<hash><ext>`, the same layout the
+/// CDN itself serves, so a mirror is a byte-for-byte stand-in for the origin.
+pub fn blobKey(a: std.mem.Allocator, kind: []const u8, hash: []const u8, ext: []const u8) ![]u8 {
+    if (hash.len < 4) return error.BadHash;
+    return std.fmt.allocPrint(a, "{s}/{s}/{s}/{s}{s}", .{ kind, hash[0..2], hash[2..4], hash, ext });
+}
+
 // ---- the client ----------------------------------------------------------------
 
 pub const Loc = struct { arch: u32, off: u64, size: u32 };
@@ -180,8 +194,11 @@ pub const Options = struct {
     patch_host: []const u8 = "us.patch.battle.net",
     /// Force a CDN host instead of the first one the service advertises.
     cdn_host: ?[]const u8 = null,
-    /// Content-addressed mirror consulted before the network.
+    /// Content-addressed mirror consulted before the network: a directory, or
+    /// `s3://<bucket>/<prefix>`.
     pool: ?[]const u8 = null,
+    /// Service and keys for an `s3://` pool. Unused for a directory.
+    s3: ?s3.Endpoint = null,
     /// Write blobs fetched from the network into `pool`.
     cache: bool = false,
     /// Use the first data row when `region` has none (dev channels are often
@@ -202,6 +219,8 @@ pub const Cdn = struct {
     arena: *std.heap.ArenaAllocator,
     client: http.Client,
     opts: Options,
+    /// The mirror consulted before the network, once resolved from `opts.pool`.
+    pool: ?*Store = null,
 
     /// Region of the row actually used (may differ from `opts.region`).
     region: []const u8,
@@ -243,6 +262,7 @@ pub const Cdn = struct {
                 .patch_host = try a.dupe(u8, opts.patch_host),
                 .cdn_host = if (opts.cdn_host) |h| try a.dupe(u8, h) else null,
                 .pool = if (opts.pool) |p| try a.dupe(u8, p) else null,
+                .s3 = opts.s3,
                 .cache = opts.cache,
                 .any_region = opts.any_region,
             },
@@ -257,6 +277,8 @@ pub const Cdn = struct {
             .build_cfg = "",
             .cdn_cfg = "",
         };
+
+        if (self.opts.pool) |spec| self.pool = try Store.open(a, io, spec, self.opts.s3);
 
         const vrow = regionLine(try self.service("versions"), self.opts.region, self.opts.any_region);
         if (vrow.len == 0) return error.NoBuild;
@@ -285,6 +307,7 @@ pub const Cdn = struct {
     pub fn close(self: *Cdn) void {
         const arena = self.arena;
         const gpa = self.gpa;
+        if (self.pool) |st| st.close();
         self.client.deinit();
         arena.deinit();
         gpa.destroy(arena);
@@ -358,30 +381,17 @@ pub const Cdn = struct {
         return std.fmt.allocPrint(a, "{s}/{s}/{s}/{s}/{s}{s}", .{ self.base, kind, hash[0..2], hash[2..4], hash, ext });
     }
 
-    fn poolPath(self: *Cdn, a: std.mem.Allocator, kind: []const u8, hash: []const u8, ext: []const u8) !?[]u8 {
-        const pool = self.opts.pool orelse return null;
-        if (hash.len < 4) return error.BadHash;
-        return try std.fmt.allocPrint(a, "{s}/{s}/{s}/{s}/{s}{s}", .{ pool, kind, hash[0..2], hash[2..4], hash, ext });
-    }
 
-    /// A content-addressed blob: local pool first, then the CDN. `range` reads a slice
+    /// A content-addressed blob: the pool first, then the CDN. `range` reads a slice
     /// (a positional read from the pool, a byte-range request from the CDN).
     pub fn readBlob(self: *Cdn, a: std.mem.Allocator, kind: []const u8, hash: []const u8, ext: []const u8, range: ?Range) ![]u8 {
-        if (try self.poolPath(self.gpa, kind, hash, ext)) |path| {
-            defer self.gpa.free(path);
-            if (range) |r| {
-                if (std.Io.Dir.cwd().openFile(self.io, path, .{})) |file| {
-                    defer file.close(self.io);
-                    const buf = try a.alloc(u8, @intCast(r.len));
-                    errdefer a.free(buf);
-                    if (file.readPositionalAll(self.io, buf, r.off)) |n| {
-                        if (n == buf.len) return buf;
-                    } else |_| {}
-                    a.free(buf);
-                } else |_| {}
-            } else if (std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .unlimited)) |d| {
-                return d;
-            } else |_| {}
+        if (self.pool) |st| {
+            const key = try blobKey(self.gpa, kind, hash, ext);
+            defer self.gpa.free(key);
+            // A pool miss - absent, unreadable, or the bucket being unreachable - is
+            // not an error: that is what the origin is for.
+            const hit = st.readObject(a, key, if (range) |r| .{ .off = r.off, .len = r.len } else null) catch null;
+            if (hit) |d| return d;
         }
         const url = try self.blobUrl(self.gpa, kind, hash, ext);
         defer self.gpa.free(url);
@@ -391,10 +401,10 @@ pub const Cdn = struct {
     }
 
     fn storeInPool(self: *Cdn, kind: []const u8, hash: []const u8, ext: []const u8, data: []const u8) !void {
-        const path = (try self.poolPath(self.gpa, kind, hash, ext)) orelse return;
-        defer self.gpa.free(path);
-        if (std.fs.path.dirname(path)) |d| std.Io.Dir.cwd().createDirPath(self.io, d) catch {};
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = data });
+        const st = self.pool orelse return;
+        const key = try blobKey(self.gpa, kind, hash, ext);
+        defer self.gpa.free(key);
+        try st.writeObject(self.gpa, key, data);
     }
 
     /// A config blob (plain text), by hash.
@@ -646,45 +656,51 @@ pub const Cdn = struct {
         return res.head.content_length;
     }
 
-    /// Download one blob into a content-addressed pool directory: a complete file is
-    /// skipped, a partial one resumes. Streams straight to disk, so a 256MB archive
-    /// never lands in memory.
+    /// Capture one blob into a pool: a complete one is skipped, and a directory
+    /// resumes a partial file. Streams straight through, so a 256MB archive never
+    /// lands in memory.
     ///
     /// Blizzard's edge answers a range starting at EOF with the whole blob instead of
-    /// 416, so the result is always checked against the advertised length and refetched
-    /// from zero when it does not line up.
-    pub fn download(self: *Cdn, dest_pool: []const u8, b: Blob) !Fetched {
+    /// 416, so a resumed directory write is checked against the advertised length and
+    /// refetched from zero when it does not line up. A bucket never resumes - an
+    /// object is all-or-nothing - so it cannot hit that.
+    pub fn download(self: *Cdn, dest: *Store, b: Blob) !Fetched {
         const a = self.gpa; // per-blob scratch: freed here, not held for the session
         if (b.hash.len < 4) return error.BadHash;
 
-        const path = try std.fmt.allocPrint(a, "{s}/{s}/{s}/{s}/{s}{s}", .{ dest_pool, b.kind, b.hash[0..2], b.hash[2..4], b.hash, b.ext });
-        defer a.free(path);
+        const key = try blobKey(a, b.kind, b.hash, b.ext);
+        defer a.free(key);
         const url = try self.blobUrl(a, b.kind, b.hash, b.ext);
         defer a.free(url);
 
-        const have: u64 = if (std.Io.Dir.cwd().statFile(self.io, path, .{})) |st| st.size else |_| 0;
+        const have: u64 = (dest.objectSize(a, key) catch null) orelse 0;
         const remote = self.remoteSize(url) catch null;
         if (remote) |r| if (have == r and have != 0) return .skipped;
-        if (std.fs.path.dirname(path)) |d| try std.Io.Dir.cwd().createDirPath(self.io, d);
 
-        const resume_at: u64 = if (remote != null and have != 0 and have < remote.?) have else 0;
-        const written = self.stream(path, url, resume_at) catch return .failed;
-        if (remote) |r| {
-            if (written == r) return if (resume_at != 0) .resumed else .downloaded;
-            if (resume_at == 0) return .failed;
-            // the edge ignored our range: start over
-            return if ((self.stream(path, url, 0) catch return .failed) == r) .downloaded else .failed;
-        }
-        return if (resume_at != 0) .resumed else .downloaded;
+        const r = remote orelse {
+            // With no advertised length a bucket cannot be written at all: a PUT has
+            // to declare its size. A directory can still take the bytes.
+            if (dest.isBucket()) return .failed;
+            _ = self.stream(dest, key, url, 0, 0) catch return .failed;
+            return .downloaded;
+        };
+
+        const resume_at: u64 = if (!dest.isBucket() and have != 0 and have < r) have else 0;
+        const written = self.stream(dest, key, url, r, resume_at) catch return .failed;
+        // The PUT declares its length, so a short body has already failed above.
+        if (dest.isBucket()) return .downloaded;
+        if (written == r) return if (resume_at != 0) .resumed else .downloaded;
+        if (resume_at == 0) return .failed;
+        return if ((self.stream(dest, key, url, r, 0) catch return .failed) == r) .downloaded else .failed;
     }
 
-    /// GET `url` into `path` starting at `resume_at`, returning the file's new length.
-    fn stream(self: *Cdn, path: []const u8, url: []const u8, resume_at: u64) !u64 {
-        const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false });
-        defer file.close(self.io);
-        var wbuf: [64 * 1024]u8 = undefined;
-        var fw = file.writer(self.io, &wbuf);
-        fw.pos = resume_at;
+    /// GET `url` into the store at `key`, starting at `resume_at`, returning how many
+    /// bytes the stored object now holds (0 for a bucket, which verifies by length).
+    fn stream(self: *Cdn, dest: *Store, key: []const u8, url: []const u8, total: u64, resume_at: u64) !u64 {
+        var ow: ObjectWriter = undefined;
+        try dest.beginWrite(&ow, self.gpa, key, total - resume_at, resume_at);
+        var ok = false;
+        defer if (!ok) ow.abort();
 
         var rbuf: [64]u8 = undefined;
         var hdr: [1]http.Header = undefined;
@@ -695,13 +711,12 @@ pub const Cdn = struct {
         }
         const res = try self.client.fetch(.{
             .location = .{ .url = url },
-            .response_writer = &fw.interface,
+            .response_writer = ow.writer(),
             .extra_headers = extra,
         });
-        try fw.interface.flush();
         if (res.status != .ok and res.status != .partial_content) return error.HttpStatus;
-        file.setLength(self.io, fw.pos) catch {};
-        return fw.pos;
+        ok = true;
+        return try ow.finish();
     }
 };
 

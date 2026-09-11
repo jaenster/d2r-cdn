@@ -36,16 +36,55 @@ d2r-cdn fetch D2R.exe -o ./bin            # install files (exe/dll), md5-verifie
 d2r-cdn extract 'data:*/excel/*' -o ./out # game files by root path
 d2r-cdn mirror /data/pool --indices       # resumable blob mirror of a build
 d2r-cdn watch /data --interval 60 --data  # poll every channel, capture new builds
+d2r-cdn steam                             # what Steam is serving (no login needed)
 ```
 
 Options worth knowing (`--help` has the rest):
 
 - `-p osib` / `-r eu` — another product (osib=beta, osit=test) or region.
-- `--pool <dir>` — read blobs from a local mirror before touching the network.
+- `--pool <dir>` — read blobs from a mirror before touching the network.
 - `--cache` — write whatever it did fetch back into that pool.
 
 Extraction is resumable and verified: files already on disk are skipped, and every
 decoded file is checked against its CKey.
+
+### Mirroring to object storage
+
+Anywhere a pool is taken — `--pool`, and the destination of `mirror` and `watch` — it
+may be `s3://<bucket>/<prefix>` instead of a directory. The same binary then mirrors
+to a disk or to a bucket; nothing else changes. Blobs stream straight from the CDN
+into the bucket, so a 256MB archive needs no local disk and no memory to match.
+
+Credentials come from the environment, never the command line:
+
+```
+S3_ENDPOINT=fsn1.your-objectstorage.com   # or AWS_ENDPOINT_URL
+S3_REGION=fsn1                            # or AWS_REGION (default us-east-1)
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+
+d2r-cdn watch s3://my-bucket/d2r --interval 60 --data
+d2r-cdn --pool s3://my-bucket/d2r/pool list     # reads blobs back out of the bucket
+```
+
+Signing is SigV4 over `std.http`, path-style addressing, no SDK.
+
+### Steam
+
+D2R also ships on Steam (appid 2536520), and `steam` reports what it is serving:
+
+```
+d2r-cdn steam                                   # print the branch table and depots
+d2r-cdn steam s3://my-bucket/d2r --interval 900 # record it, alert on any change
+```
+
+The branch table comes from PICS app-info over plain HTTP with **no account**, which
+is enough to see a branch appear, a build move, or a branch lose its password — the
+way an internal build reaches the public. Depot *bytes* are a different matter: those
+need a logged-in account that owns the app.
+
+Two things Steam gives that the TACT path does not: a manifest id stays fetchable long
+after its build has rotated out (a delisted TACT config just returns 403), and the
+`privatebranches` flag tells you when there are branches you cannot see.
 
 ## Library
 
@@ -69,9 +108,12 @@ after that is pulled on demand and cached until `close`:
 - the install and root manifests, and archive-index lookup for either
 - per-file extraction by CKey, install name or root path
 - whether a channel is encrypted, and which Armadillo key it wants
-- blob mirroring into a local pool, resumable
+- blob mirroring into a pool — a directory or a bucket — resumable
 
-It is all in `src/tact.zig`. `example/fetch.zig` is the smallest thing that uses it.
+`src/tact.zig` is the CDN itself; `src/store.zig` is where a pool lives (directory or
+bucket, decided internally), `src/s3.zig` is the SigV4 client under it, and
+`src/steam.zig` reads Steam's branch table. `example/fetch.zig` is the smallest thing
+that uses any of it.
 
 ## Docker
 
@@ -101,6 +143,9 @@ scripts/mirror.sh <dir>     # resumable full mirror of a build
 scripts/scrape.sh <dir>     # watch every product channel, capture new builds
 ```
 
+They predate the CLI and only write to a directory; `mirror` and `watch` cover both
+targets and are what the deployments run.
+
 ## Format notes
 
 - Content is addressed by MD5: a hash `abcdef…` lives at `<base>/<kind>/ab/cd/abcdef…`.
@@ -108,7 +153,8 @@ scripts/scrape.sh <dir>     # watch every product channel, capture new builds
 - EKey is the CDN locator; CKey (md5 of the decoded file) is the integrity check.
 - D2R's root manifest is text: `path|CKey|platform|basename` per line.
 - A range request that starts at EOF comes back as the whole blob with a 200, not a
-  416 — resumable downloads have to check the length they got.
+  416 — resumable downloads have to check the length they got. A bucket never resumes
+  (an object is all-or-nothing), so only a directory mirror has to care.
 
 ---
 
