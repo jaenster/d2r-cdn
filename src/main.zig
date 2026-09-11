@@ -497,6 +497,12 @@ fn scanProduct(gpa: std.mem.Allocator, a: std.mem.Allocator, base_opts: tact.Opt
             };
             try writeState(a, root, product, ".data", cdn.build_config);
             try alert(a, flags.webhook, try std.fmt.allocPrint(a, "{s} DONE {s} ({d} new blobs)", .{ product, cdn.version, n }));
+            // The blobs are content-addressed and say nothing about what they are.
+            // Keeping the build's own executables decoded means a build can be
+            // identified - and diffed against the next one - without rebuilding the
+            // whole CASC view first.
+            captureBinaries(a, cdn, root, product) catch |err|
+                note("[watch] {s}: binaries: {s}\n", .{ product, @errorName(err) });
         }
     }
 }
@@ -574,6 +580,24 @@ fn steamPass(a: std.mem.Allocator, root: ?*tact.Store, flags: Flags) !void {
     if (pb_last.len != 0 and !std.mem.eql(u8, pb_last, pb_now))
         try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} private-branches flag {s} -> {s}", .{ app.appid, pb_last, pb_now }));
     try store.writeObject(a, pb_key, pb_now);
+}
+
+/// Decode this build's install files (the exes and dlls) into
+/// `binaries/<product>-<build>/`. Cheap next to the archives - about 88MB for osi -
+/// and it is the only part of the mirror a human can identify on sight.
+fn captureBinaries(a: std.mem.Allocator, cdn: *tact.Cdn, root: *tact.Store, product: []const u8) !void {
+    const entries = try cdn.install();
+    const label = if (cdn.build_id.len != 0) cdn.build_id else cdn.build_config;
+    var wrote: usize = 0;
+    for (entries) |e| {
+        const key = try std.fmt.allocPrint(a, "binaries/{s}-{s}/{s}", .{ product, label, std.fs.path.basename(e.name) });
+        if ((root.objectSize(a, key) catch null) != null) continue;
+        const data = cdn.extractInstall(e.name) catch continue;
+        defer cdn.gpa.free(data);
+        try root.writeObject(a, key, data);
+        wrote += 1;
+    }
+    if (wrote != 0) note("[watch] {s}: {d} binaries -> binaries/{s}-{s}/\n", .{ product, wrote, product, label });
 }
 
 fn readState(a: std.mem.Allocator, root: *tact.Store, product: []const u8, suffix: []const u8) ![]const u8 {
