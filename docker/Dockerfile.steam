@@ -1,0 +1,59 @@
+# The CLI plus DepotDownloader, for capturing Steam builds.
+#
+# A separate image from docker/Dockerfile on purpose: DepotDownloader's linux-x64
+# build is a self-contained .NET binary linked against glibc, so it cannot run on the
+# musl/alpine base the watcher uses. Our own binary is statically linked and runs on
+# either, so only this image pays for the bigger base.
+#
+# Globalization is set to invariant so .NET does not need ICU - nothing here formats
+# anything for a human locale, and it keeps ~30MB of ICU out of the image.
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS build
+ARG ZIG_VERSION=0.16.0
+ARG BUILDARCH
+ARG TARGETARCH
+RUN apk add --no-cache curl tar xz && \
+    case "$BUILDARCH" in \
+      amd64) host=x86_64 ;; \
+      arm64) host=aarch64 ;; \
+      *) echo "no zig build for $BUILDARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${host}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt && \
+    ln -s "/opt/zig-${host}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+WORKDIR /src
+COPY build.zig build.zig.zon ./
+COPY src ./src
+COPY example ./example
+RUN case "$TARGETARCH" in \
+      amd64) zt=x86_64-linux-musl ;; \
+      arm64) zt=aarch64-linux-musl ;; \
+      *) echo "no zig target for $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    zig build -Doptimize=ReleaseFast -Dtarget="$zt" --prefix /out
+
+FROM debian:stable-slim
+ARG TARGETARCH
+ARG DD_VERSION=3.4.0
+LABEL org.opencontainers.image.source="https://github.com/jaenster/d2r-cdn" \
+      org.opencontainers.image.description="d2r-cdn plus DepotDownloader, for capturing Steam builds"
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates unzip curl tzdata && \
+    case "$TARGETARCH" in \
+      amd64) dd=linux-x64 ;; \
+      arm64) dd=linux-arm64 ;; \
+      *) echo "no DepotDownloader build for $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/dd.zip \
+      "https://github.com/SteamRE/DepotDownloader/releases/download/DepotDownloader_${DD_VERSION}/DepotDownloader-${dd}.zip" && \
+    unzip -q /tmp/dd.zip -d /opt/depotdownloader && rm /tmp/dd.zip && \
+    chmod +x /opt/depotdownloader/DepotDownloader && \
+    apt-get purge -y unzip curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bin/d2r-cdn /usr/local/bin/d2r-cdn
+ENV DEPOTDOWNLOADER=/opt/depotdownloader/DepotDownloader \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1
+# DepotDownloader keeps its login token in .NET isolated storage under $HOME, so a
+# persistent HOME is what makes an unattended run possible.
+ENV HOME=/steam
+WORKDIR /steam
+ENTRYPOINT ["d2r-cdn"]
+CMD ["--help"]

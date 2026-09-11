@@ -20,6 +20,7 @@ const usage =
     \\  mirror <dest> [--indices]  mirror the build's blobs into a pool, resumable
     \\  watch <dest>               poll every product channel, capture new builds
     \\  steam [<dest>]             poll the Steam branch table (no login needed)
+    \\  steam-capture <dest>       download Steam depots (needs an owning account)
     \\
     \\options:
     \\  -p, --product <code>   product code (default osi; osib=beta, osit=test)
@@ -41,9 +42,14 @@ const usage =
     \\           --dry-run     list what would be written, extract nothing
     \\  watch    --interval <s>  loop every s seconds (default: one pass and exit)
     \\           --data          mirror the full build when a new one appears
-    \\  steam    --app <id>      Steam appid (default 2536520, D2R Infernal Edition)
+    \\  steam    --app <id,..>   Steam appids (default 2536520, D2R Infernal Edition)
     \\           --branch <name> which branch's manifest ids to report (default public)
     \\           --interval <s>  loop every s seconds
+    \\           --stagger <n>   one of n replicas: offset the first pass by my slot
+    \\  steam-capture            download a build's depots (needs a Steam account)
+    \\           --files <re,..> only files matching these regexes, e.g. '.*\.(exe|dll)$'
+    \\           --scratch <dir> where a depot is staged before upload (default ./steam-scratch)
+    \\           --depot <id>    just this depot
     \\           --webhook <url> Discord webhook (or $DISCORD_WEBHOOK)
     \\           --products <l>  space-separated codes (default: known + brute force)
     \\
@@ -55,6 +61,7 @@ const usage =
     \\  d2r-cdn mirror /data/pool --indices
     \\  d2r-cdn watch /data --interval 60 --data
     \\  d2r-cdn steam s3://bucket/d2r --interval 900
+    \\  d2r-cdn steam-capture s3://bucket/d2r --files '.*\.(exe|dll)$'
     \\
 ;
 
@@ -147,10 +154,14 @@ pub fn main(init: std.process.Init) !void {
             flags.products = args.value(arg);
         } else if (std.mem.eql(u8, arg, "--app")) {
             flags.app = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--stagger")) {
+            flags.stagger = std.fmt.parseInt(u32, args.value(arg), 10) catch fail("--stagger wants a count", .{});
         } else if (std.mem.eql(u8, arg, "--branch")) {
             flags.branch = args.value(arg);
         } else if (std.mem.eql(u8, arg, "--branchpassword")) {
             flags.branch_password = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--files")) {
+            flags.files = args.value(arg);
         } else if (std.mem.eql(u8, arg, "--scratch")) {
             flags.scratch = args.value(arg);
         } else if (std.mem.eql(u8, arg, "--depot")) {
@@ -249,8 +260,10 @@ const Flags = struct {
     webhook: ?[]const u8 = null,
     products: ?[]const u8 = null,
     app: []const u8 = tact.steam.d2r_appid,
+    stagger: u32 = 0,
     branch: []const u8 = "public",
     branch_password: []const u8 = "",
+    files: ?[]const u8 = null,
     scratch: []const u8 = "./steam-scratch",
     depot: ?[]const u8 = null,
 };
@@ -531,19 +544,44 @@ fn steamWatch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.
         null;
     defer if (root) |r| r.close();
 
+    // Several replicas watching the same thing should spread themselves across the
+    // interval rather than all polling at once: the point of running them on separate
+    // hosts is separate egress, which is wasted if they fire together. The slot comes
+    // from the pod's own ordinal, so nothing has to be configured per replica.
+    if (flags.stagger > 1 and flags.interval != 0) {
+        const slot = ordinal() % flags.stagger;
+        const offset = @as(u64, flags.interval) * slot / flags.stagger;
+        if (offset != 0) {
+            note("[steam] replica {d}/{d}: first pass in {d}s\n", .{ slot, flags.stagger, offset });
+            try io_.sleep(.fromMilliseconds(@as(i64, @intCast(offset)) * 1000), .awake);
+        }
+    }
+
     var pass_arena = std.heap.ArenaAllocator.init(gpa);
     defer pass_arena.deinit();
     while (true) {
-        steamPass(pass_arena.allocator(), root, flags) catch |err|
-            note("[steam] {s}\n", .{@errorName(err)});
+        var it = std.mem.tokenizeAny(u8, flags.app, " ,");
+        while (it.next()) |appid| {
+            steamPass(pass_arena.allocator(), root, flags, appid) catch |err|
+                note("[steam] {s}: {s}\n", .{ appid, @errorName(err) });
+        }
         if (flags.interval == 0) return;
         _ = pass_arena.reset(.retain_capacity);
         try io_.sleep(.fromMilliseconds(@as(i64, flags.interval) * 1000), .awake);
     }
 }
 
-fn steamPass(a: std.mem.Allocator, root: ?*tact.Store, flags: Flags) !void {
-    const app = try tact.steam.fetchApp(a, io_, flags.app, flags.branch);
+/// This replica's number, from the trailing digits of the hostname - which for a
+/// StatefulSet pod is `<name>-<ordinal>`. Anything else is replica 0.
+fn ordinal() u32 {
+    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const host = std.posix.gethostname(&buf) catch return 0;
+    const dash = std.mem.lastIndexOfScalar(u8, host, '-') orelse return 0;
+    return std.fmt.parseInt(u32, host[dash + 1 ..], 10) catch 0;
+}
+
+fn steamPass(a: std.mem.Allocator, root: ?*tact.Store, flags: Flags, appid: []const u8) !void {
+    const app = try tact.steam.fetchApp(a, io_, appid, flags.branch);
 
     note("[steam] {s} ({s}) - {d} branches, {d} depots, {d:.1} GB on {s}{s}\n", .{
         app.name,               app.appid, app.branches.len, app.depots.len,
@@ -636,9 +674,24 @@ fn steamCapture(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tac
         .branch_password = flags.branch_password,
     };
 
-    const app = try tact.steam.fetchApp(arena, io_, flags.app, flags.branch);
-    const br = app.branch(flags.branch) orelse fail("app {s} has no branch '{s}'", .{ flags.app, flags.branch });
-    note("[capture] {s} branch {s} build {s}: {d} depots, {d:.1} GB\n", .{ app.name, br.name, br.build_id, app.depots.len, gb(app.totalSize()) });
+    var bad: usize = 0;
+    var apps = std.mem.tokenizeAny(u8, flags.app, " ,");
+    while (apps.next()) |appid| {
+        captureApp(gpa, arena, store, login, appid, flags) catch |err| {
+            note("[capture] {s}: {s}\n", .{ appid, @errorName(err) });
+            bad += 1;
+        };
+    }
+    if (bad != 0) return error.CaptureIncomplete;
+}
+
+fn captureApp(gpa: std.mem.Allocator, arena: std.mem.Allocator, store: *tact.Store, login: tact.steam.Login, appid: []const u8, flags: Flags) !void {
+    const app = try tact.steam.fetchApp(arena, io_, appid, flags.branch);
+    const br = app.branch(flags.branch) orelse return error.NoSuchBranch;
+    note("[capture] {s} branch {s} build {s}: {d} depots, {d:.1} GB{s}\n", .{
+        app.name, br.name, br.build_id, app.depots.len, gb(app.totalSize()),
+        if (flags.files != null) " (filtered)" else "",
+    });
 
     var done: usize = 0;
     var bytes: u64 = 0;
@@ -651,20 +704,18 @@ fn steamCapture(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tac
         defer pass.deinit();
         const a = pass.allocator();
 
-        // The marker holds the manifest id, so a depot re-published under the same
+        // The marker holds the manifest id, so a depot republished under the same
         // build is captured again rather than skipped.
         const marker = try std.fmt.allocPrint(a, "steam/{s}/state/captured-{s}-{s}-{s}", .{ app.appid, br.name, br.build_id, d.id });
-        if (std.mem.eql(u8, try store.readText(a, marker), d.manifest)) {
-            note("[capture] depot {s}: already captured\n", .{d.id});
-            continue;
-        }
+        if (std.mem.eql(u8, try store.readText(a, marker), d.manifest)) continue;
 
         const dir = try std.fmt.allocPrint(a, "{s}/{s}-{s}", .{ flags.scratch, app.appid, d.id });
-        note("[capture] depot {s} manifest {s} ({d:.1} GB) -> {s}\n", .{ d.id, d.manifest, gb(d.size), dir });
+        note("[capture] depot {s} manifest {s} ({d:.1} GB declared) -> {s}\n", .{ d.id, d.manifest, gb(d.size), dir });
         tact.steam.downloadDepot(a, io_, login, app.appid, .{
             .depot = d.id,
             .manifest = d.manifest,
             .branch = br.name,
+            .files = flags.files,
         }, dir) catch |err| {
             note("[capture] depot {s}: {s}\n", .{ d.id, @errorName(err) });
             try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} depot {s} DOWNLOAD FAILED ({s})", .{ app.appid, d.id, @errorName(err) }));
@@ -685,11 +736,13 @@ fn steamCapture(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tac
         // other copy until then.
         std.Io.Dir.cwd().deleteTree(io_, dir) catch |err| note("[capture] depot {s}: scratch not removed: {s}\n", .{ d.id, @errorName(err) });
         try store.writeObject(a, marker, d.manifest);
-        note("[capture] depot {s}: {d:.1} GB stored\n", .{ d.id, gb(n) });
     }
 
-    const msg = try std.fmt.allocPrint(arena, "STEAM {s} branch {s} build {s}: {d} depots captured ({d:.1} GB), {d} failed", .{ app.appid, br.name, br.build_id, done, gb(bytes), failed });
-    if (done != 0 or failed != 0) try alert(arena, flags.webhook, msg) else note("[capture] nothing to do\n", .{});
+    if (done != 0 or failed != 0) {
+        try alert(arena, flags.webhook, try std.fmt.allocPrint(arena, "STEAM {s} ({s}) build {s}: {d} depots captured ({d:.1} MB), {d} failed", .{
+            app.appid, app.name, br.build_id, done, mb(bytes), failed,
+        }));
+    }
     if (failed != 0) return error.CaptureIncomplete;
 }
 
@@ -704,8 +757,9 @@ fn uploadTree(a: std.mem.Allocator, store: *tact.Store, dir: []const u8, prefix:
     var files: usize = 0;
     while (try it.next(io_)) |e| {
         if (e.kind != .file) continue;
-        // DepotDownloader's own bookkeeping, not game content.
+        // DepotDownloader's own bookkeeping and our file list, not game content.
         if (std.mem.startsWith(u8, e.path, ".DepotDownloader")) continue;
+        if (std.mem.eql(u8, e.path, ".filelist.txt")) continue;
 
         const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, e.path });
         defer a.free(key);

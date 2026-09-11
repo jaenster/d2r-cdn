@@ -195,6 +195,10 @@ pub const DepotJob = struct {
     depot: []const u8,
     manifest: []const u8,
     branch: []const u8,
+    /// Comma-separated regexes; only matching files are downloaded. Null takes the
+    /// whole depot. This is what makes capturing a 86GB depot for its executables
+    /// cost megabytes instead.
+    files: ?[]const u8 = null,
 };
 
 /// Run DepotDownloader for exactly one depot at one manifest, into `dir`.
@@ -231,6 +235,19 @@ pub fn downloadDepot(
         try argv.append("-remember-password");
     }
     if (login.branch_password.len != 0) try argv.appendSlice(&.{ "-branchpassword", login.branch_password });
+
+    // A file list is a file on disk, one pattern per line, `regex:` prefixed to match
+    // rather than compare. It has to live somewhere the child can read, so it goes
+    // beside the download it belongs to.
+    if (job.files) |patterns| {
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+        const list_path = try std.fmt.allocPrint(a, "{s}/.filelist.txt", .{dir});
+        var out = std.Io.Writer.Allocating.init(a);
+        var it = std.mem.tokenizeScalar(u8, patterns, ',');
+        while (it.next()) |pat| try out.writer.print("regex:{s}\n", .{std.mem.trim(u8, pat, " ")});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = list_path, .data = out.written() });
+        try argv.appendSlice(&.{ "-filelist", list_path });
+    }
 
     var child = try std.process.spawn(io, .{ .argv = argv.items });
     const term = try child.wait(io);
