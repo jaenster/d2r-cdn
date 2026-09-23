@@ -42,13 +42,19 @@ const usage =
     \\           --dry-run     list what would be written, extract nothing
     \\  watch    --interval <s>  loop every s seconds (default: one pass and exit)
     \\           --data          mirror the full build when a new one appears
-    \\  steam    --app <id,..>   Steam appids (default 2536520, D2R Infernal Edition)
+    \\  steam    --app <spec,..> Steam apps, each <appid>[@<seconds>][:<branch>]: poll no
+    \\                           more often than that, capture only that branch
+    \\                           (default 2536520, D2R Infernal Edition)
     \\           --branch <name> which branch's manifest ids to report (default public)
     \\           --interval <s>  loop every s seconds
     \\           --stagger <n>   one of n replicas: offset the first pass by my slot
-    \\  steam-capture            download a build's depots (needs a Steam account)
-    \\           --files <re,..> only files matching these regexes, e.g. '.*\.(exe|dll)$'
+    \\  steam-capture            list and download every branch's depots (needs a Steam
+    \\                           account); --app, --branch and --interval as for steam
+    \\           --files <re,..> big depots: only files matching these regexes,
+    \\                           e.g. '.*\.(exe|dll|pdb)$'
+    \\           --whole-under <mb> depots smaller than this are taken whole (default 512)
     \\           --scratch <dir> where a depot is staged before upload (default ./steam-scratch)
+    \\           --manifest <id> one older build by manifest id (with --depot)
     \\           --depot <id>    just this depot
     \\           --webhook <url> Discord webhook (or $DISCORD_WEBHOOK)
     \\           --products <l>  space-separated codes (default: known + brute force)
@@ -61,7 +67,7 @@ const usage =
     \\  d2r-cdn mirror /data/pool --indices
     \\  d2r-cdn watch /data --interval 60 --data
     \\  d2r-cdn steam s3://bucket/d2r --interval 900
-    \\  d2r-cdn steam-capture s3://bucket/d2r --files '.*\.(exe|dll)$'
+    \\  d2r-cdn steam-capture s3://bucket/d2r --interval 20 --files '.*\.(exe|dll|pdb)$'
     \\
 ;
 
@@ -166,6 +172,9 @@ pub fn main(init: std.process.Init) !void {
             flags.scratch = args.value(arg);
         } else if (std.mem.eql(u8, arg, "--depot")) {
             flags.depot = args.value(arg);
+        } else if (std.mem.eql(u8, arg, "--whole-under")) {
+            const n = std.fmt.parseInt(u64, args.value(arg), 10) catch fail("--whole-under wants megabytes", .{});
+            flags.whole_under = n * 1024 * 1024;
         } else if (std.mem.eql(u8, arg, "--manifest")) {
             flags.manifest = args.value(arg);
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
@@ -241,7 +250,7 @@ pub fn main(init: std.process.Init) !void {
         try extract(arena, cdn, rest.items, out_path orelse "extracted", flags);
     } else if (std.mem.eql(u8, cmd, "mirror")) {
         const spec = if (rest.items.len > 0) rest.items[0] else out_path orelse fail("mirror needs a destination", .{});
-        const dest = tact.Store.open(arena, io_, spec, opts.s3) catch |err| fail("pool {s}: {s}", .{ spec, @errorName(err) });
+        const dest = tact.Store.open(gpa, io_, spec, opts.s3) catch |err| fail("pool {s}: {s}", .{ spec, @errorName(err) });
         defer dest.close();
         _ = try mirror(cdn, dest, flags);
     } else {
@@ -263,7 +272,11 @@ const Flags = struct {
     products: ?[]const u8 = null,
     app: []const u8 = tact.steam.d2r_appid,
     stagger: u32 = 0,
-    branch: []const u8 = "public",
+    /// Only this branch. The watcher reports manifests for it (default public); a
+    /// capture takes every branch unless told otherwise.
+    branch: ?[]const u8 = null,
+    /// Depots declared smaller than this are captured whole, bigger ones filtered.
+    whole_under: u64 = 512 * 1024 * 1024,
     branch_password: []const u8 = "",
     files: ?[]const u8 = null,
     scratch: []const u8 = "./steam-scratch",
@@ -448,10 +461,10 @@ fn watch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.Optio
 
     // The channel history and the blobs live in the same place, one prefix apart -
     // a directory on this machine or a bucket, decided by `spec` alone.
-    const root = tact.Store.open(arena, io_, spec, base_opts.s3) catch |err| fail("{s}: {s}", .{ spec, @errorName(err) });
+    const root = tact.Store.open(gpa, io_, spec, base_opts.s3) catch |err| fail("{s}: {s}", .{ spec, @errorName(err) });
     defer root.close();
     const pool_spec = try std.fmt.allocPrint(arena, "{s}/pool", .{std.mem.trimEnd(u8, spec, "/")});
-    const pool = tact.Store.open(arena, io_, pool_spec, base_opts.s3) catch |err| fail("{s}: {s}", .{ pool_spec, @errorName(err) });
+    const pool = tact.Store.open(gpa, io_, pool_spec, base_opts.s3) catch |err| fail("{s}: {s}", .{ pool_spec, @errorName(err) });
     defer pool.close();
 
     note("[watch] {d} product channels -> {s}\n", .{ products.items.len, root.spec });
@@ -537,15 +550,59 @@ fn scanProduct(gpa: std.mem.Allocator, a: std.mem.Allocator, base_opts: tact.Opt
     }
 }
 
+/// Decode this build's install files (the exes and dlls) into
+/// `binaries/<product>-<build>/`. Cheap next to the archives - about 88MB for osi -
+/// and it is the only part of the mirror a human can identify on sight.
+fn captureBinaries(a: std.mem.Allocator, cdn: *tact.Cdn, root: *tact.Store, product: []const u8) !void {
+    const entries = try cdn.install();
+    const label = if (cdn.build_id.len != 0) cdn.build_id else cdn.build_config;
+    var wrote: usize = 0;
+    for (entries) |e| {
+        const key = try std.fmt.allocPrint(a, "binaries/{s}-{s}/{s}", .{ product, label, std.fs.path.basename(e.name) });
+        if ((root.objectSize(a, key) catch null) != null) continue;
+        const data = cdn.extractInstall(e.name) catch continue;
+        defer cdn.gpa.free(data);
+        try root.writeObject(a, key, data);
+        wrote += 1;
+    }
+    if (wrote != 0) note("[watch] {s}: {d} binaries -> binaries/{s}-{s}/\n", .{ product, wrote, product, label });
+}
+
 // ---- steam ---------------------------------------------------------------------
+
+fn nowSecs() i64 {
+    return @intCast(@divFloor(std.Io.Timestamp.now(io_, .real).nanoseconds, std.time.ns_per_s));
+}
+
+fn appSpecs(a: std.mem.Allocator, list_: []const u8) ![]tact.steam.AppSpec {
+    var specs = std.array_list.Managed(tact.steam.AppSpec).init(a);
+    var it = std.mem.tokenizeAny(u8, list_, " ,");
+    while (it.next()) |s| try specs.append(tact.steam.AppSpec.parse(s) catch
+        fail("--app: '{s}' is not <appid>[@<seconds>][:<branch>]", .{s}));
+    return specs.toOwnedSlice();
+}
+
+/// Whether an app with a slower cadence is due. Half an interval of slack, so an app
+/// asking for 300s on a 60s loop is polled every fifth pass rather than every sixth.
+fn due(spec: tact.steam.AppSpec, last: i64, now: i64, interval: u32) bool {
+    if (spec.every == 0 or last == 0) return true;
+    return now - last + @divTrunc(@as(i64, interval), 2) >= spec.every;
+}
+
+/// Longest a poller backs off to while the PICS mirror answers 429.
+const max_backoff: u32 = 900;
 
 fn steamWatch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.Options, spec: ?[]const u8, flags: Flags) !void {
     // No destination: just report what Steam is serving right now.
     const root: ?*tact.Store = if (spec) |sp|
-        tact.Store.open(arena, io_, sp, base_opts.s3) catch |err| fail("{s}: {s}", .{ sp, @errorName(err) })
+        tact.Store.open(gpa, io_, sp, base_opts.s3) catch |err| fail("{s}: {s}", .{ sp, @errorName(err) })
     else
         null;
     defer if (root) |r| r.close();
+
+    const apps = try appSpecs(arena, flags.app);
+    const last = try arena.alloc(i64, apps.len);
+    @memset(last, 0);
 
     // Several replicas watching the same thing should spread themselves across the
     // interval rather than all polling at once: the point of running them on separate
@@ -562,15 +619,23 @@ fn steamWatch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.
 
     var pass_arena = std.heap.ArenaAllocator.init(gpa);
     defer pass_arena.deinit();
+    var delay = flags.interval;
     while (true) {
-        var it = std.mem.tokenizeAny(u8, flags.app, " ,");
-        while (it.next()) |appid| {
-            steamPass(pass_arena.allocator(), root, flags, appid) catch |err|
-                note("[steam] {s}: {s}\n", .{ appid, @errorName(err) });
+        var limited = false;
+        for (apps, 0..) |app, i| {
+            const now = nowSecs();
+            if (!due(app, last[i], now, flags.interval)) continue;
+            last[i] = now;
+            steamPass(pass_arena.allocator(), root, flags, app.id) catch |err| {
+                if (err == error.SteamRateLimited) limited = true;
+                note("[steam] {s}: {s}\n", .{ app.id, @errorName(err) });
+            };
         }
         if (flags.interval == 0) return;
-        _ = pass_arena.reset(.retain_capacity);
-        try io_.sleep(.fromMilliseconds(@as(i64, flags.interval) * 1000), .awake);
+        _ = pass_arena.reset(.{ .retain_with_limit = 4 << 20 });
+        delay = if (limited) @min(@max(delay, flags.interval) * 2, max_backoff) else flags.interval;
+        if (limited) note("[steam] rate limited by the PICS mirror, next pass in {d}s\n", .{delay});
+        try io_.sleep(.fromMilliseconds(@as(i64, delay) * 1000), .awake);
     }
 }
 
@@ -584,20 +649,25 @@ fn ordinal() u32 {
 }
 
 fn steamPass(a: std.mem.Allocator, root: ?*tact.Store, flags: Flags, appid: []const u8) !void {
-    const app = try tact.steam.fetchApp(a, io_, appid, flags.branch);
-
-    note("[steam] {s} ({s}) - {d} branches, {d} depots, {d:.1} GB on {s}{s}\n", .{
-        app.name,               app.appid, app.branches.len, app.depots.len,
-        gb(app.totalSize()), flags.branch, if (app.private_branches) ", has private branches" else "",
-    });
-    for (app.branches) |b| note("  {s:<16} build {s:<10}{s}{s} {s}\n", .{
-        b.name,                                 b.build_id,
-        if (b.password_required) " [pwd]" else "", if (b.lcs_required) " [lcs]" else "",
-        b.description,
-    });
-
-    const store = root orelse return;
+    const branch_name = flags.branch orelse "public";
+    const app = try tact.steam.fetchApp(a, io_, appid, branch_name);
     const digest = try tact.steam.branchDigest(a, app);
+
+    const store = root orelse {
+        note("[steam] {s} ({s}) - {d} branches, {d} depots, {d:.1} GB on {s}{s}\n", .{
+            app.name,               app.appid, app.branches.len, app.depots.len,
+            gb(app.totalSize()), branch_name, if (app.private_branches) ", has private branches" else "",
+        });
+        for (app.branches) |b| note("  {s:<16} build {s:<10}{s}{s} {s}\n", .{
+            b.name,                                 b.build_id,
+            if (b.password_required) " [pwd]" else "", if (b.lcs_required) " [lcs]" else "",
+            b.description,
+        });
+        return;
+    };
+    // One line a pass: a loop that polls every minute should not print a table.
+    note("[steam] {s} {s}{s}\n", .{ app.appid, digest, if (app.private_branches) " privatebranches" else "" });
+
     const key_prefix = try std.fmt.allocPrint(a, "steam/{s}", .{app.appid});
 
     // A branch appearing, vanishing, losing its password or moving to a new build
@@ -634,31 +704,10 @@ fn steamPass(a: std.mem.Allocator, root: ?*tact.Store, flags: Flags, appid: []co
     const pb_last = try store.readText(a, pb_key);
     if (pb_last.len != 0 and !std.mem.eql(u8, pb_last, pb_now))
         try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} private-branches flag {s} -> {s}", .{ app.appid, pb_last, pb_now }));
-    try store.writeObject(a, pb_key, pb_now);
+    if (!std.mem.eql(u8, pb_last, pb_now)) try store.writeObject(a, pb_key, pb_now);
 }
 
-/// Decode this build's install files (the exes and dlls) into
-/// `binaries/<product>-<build>/`. Cheap next to the archives - about 88MB for osi -
-/// and it is the only part of the mirror a human can identify on sight.
-fn captureBinaries(a: std.mem.Allocator, cdn: *tact.Cdn, root: *tact.Store, product: []const u8) !void {
-    const entries = try cdn.install();
-    const label = if (cdn.build_id.len != 0) cdn.build_id else cdn.build_config;
-    var wrote: usize = 0;
-    for (entries) |e| {
-        const key = try std.fmt.allocPrint(a, "binaries/{s}-{s}/{s}", .{ product, label, std.fs.path.basename(e.name) });
-        if ((root.objectSize(a, key) catch null) != null) continue;
-        const data = cdn.extractInstall(e.name) catch continue;
-        defer cdn.gpa.free(data);
-        try root.writeObject(a, key, data);
-        wrote += 1;
-    }
-    if (wrote != 0) note("[watch] {s}: {d} binaries -> binaries/{s}-{s}/\n", .{ product, wrote, product, label });
-}
-
-/// An absent state object is "never seen"; an unreadable one is an error, because
-/// treating a failed read as "never seen" would alert about a build that is already
-/// recorded - and keep doing it every pass.
-/// Capture a Steam build: every depot of a branch, downloaded one at a time and
+/// Capture Steam builds: every depot of every branch, downloaded one at a time and
 /// uploaded as it completes, so the scratch disk only ever holds one depot.
 ///
 /// Depot bytes need an account that owns the app - Steam issues depot keys only after
@@ -666,8 +715,12 @@ fn captureBinaries(a: std.mem.Allocator, cdn: *tact.Cdn, root: *tact.Store, prod
 /// anonymously. The login token lives in DepotDownloader's isolated storage under
 /// $HOME, so an unattended run needs a persistent HOME and one interactive login
 /// first to satisfy Steam Guard.
+///
+/// With --interval it loops, and is built to: a depot it has seen through costs no
+/// request at all on later passes, a manifest Steam refuses is asked for again only
+/// every quarter hour, and nothing reaches Discord unless something changed.
 fn steamCapture(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.Options, dest: []const u8, flags: Flags, env: *const std.process.Environ.Map) !void {
-    const store = tact.Store.open(arena, io_, dest, base_opts.s3) catch |err| fail("{s}: {s}", .{ dest, @errorName(err) });
+    const store = tact.Store.open(gpa, io_, dest, base_opts.s3) catch |err| fail("{s}: {s}", .{ dest, @errorName(err) });
     defer store.close();
 
     const login: tact.steam.Login = .{
@@ -677,112 +730,599 @@ fn steamCapture(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tac
         .branch_password = flags.branch_password,
     };
 
-    var bad: usize = 0;
-    var apps = std.mem.tokenizeAny(u8, flags.app, " ,");
-    while (apps.next()) |appid| {
-        captureApp(gpa, arena, store, login, appid, flags) catch |err| {
-            note("[capture] {s}: {s}\n", .{ appid, @errorName(err) });
-            bad += 1;
-        };
+    if (flags.manifest) |gid| return captureManifest(arena, store, login, flags, gid);
+
+    const apps = try appSpecs(arena, flags.app);
+    var cap: Capture = .{
+        .gpa = gpa,
+        .store = store,
+        .login = login,
+        .flags = flags,
+        .login_hint = env.get("STEAM_LOGIN_HINT") orelse
+            "log in once, interactively, with the same HOME: DepotDownloader -app <appid> -manifest-only -username <name> -remember-password",
+    };
+    defer cap.deinit();
+    const last = try arena.alloc(i64, apps.len);
+    @memset(last, 0);
+
+    var pass_arena = std.heap.ArenaAllocator.init(gpa);
+    defer pass_arena.deinit();
+    var delay = flags.interval;
+    while (true) {
+        const a = pass_arena.allocator();
+        var limited = false;
+        cap.failures = 0;
+        for (apps, 0..) |spec, i| {
+            const now = nowSecs();
+            if (!due(spec, last[i], now, flags.interval)) continue;
+            last[i] = now;
+            // The first app listed is the one that matters: it gets every pass in
+            // full. The others get one DepotDownloader run a pass, so a new build of
+            // theirs is caught up on over a few passes instead of stalling the first
+            // app's cadence while it downloads.
+            cap.budget = if (i == 0) null else 1;
+            cap.captureApp(a, spec) catch |err| switch (err) {
+                // Every later depot would fail the same way; one alert, then wait.
+                error.SteamLogin => {
+                    cap.loginFailed(a) catch |e| note("[capture] login alert: {s}\n", .{@errorName(e)});
+                    cap.failures += 1;
+                    break;
+                },
+                error.SteamRateLimited => {
+                    limited = true;
+                    note("[capture] {s}: rate limited by the PICS mirror\n", .{spec.id});
+                },
+                else => {
+                    note("[capture] {s}: {s}\n", .{ spec.id, @errorName(err) });
+                    cap.failures += 1;
+                },
+            };
+        }
+        if (flags.interval == 0) {
+            if (cap.failures != 0) return error.CaptureIncomplete;
+            return;
+        }
+        _ = pass_arena.reset(.{ .retain_with_limit = 8 << 20 });
+        delay = if (limited) @min(@max(delay, flags.interval) * 2, max_backoff) else flags.interval;
+        if (limited) note("[capture] backing off, next pass in {d}s\n", .{delay});
+        try io_.sleep(.fromMilliseconds(@as(i64, delay) * 1000), .awake);
     }
-    if (bad != 0) return error.CaptureIncomplete;
 }
 
-fn captureApp(gpa: std.mem.Allocator, arena: std.mem.Allocator, store: *tact.Store, login: tact.steam.Login, appid: []const u8, flags: Flags) !void {
-    // An explicit manifest is a build PICS no longer lists - the only way to reach
-    // one of Steam's older builds, since the record only ever names what is current.
-    // It is stored under the manifest id, because that is the only name it has.
-    if (flags.manifest) |gid| {
-        const depot = flags.depot orelse fail("--manifest needs --depot", .{});
-        const label = try std.fmt.allocPrint(arena, "manifest-{s}", .{gid});
-        return captureDepot(gpa, arena, store, login, appid, flags, .{
-            .depot = depot,
-            .manifest = gid,
-            .branch = flags.branch,
-            .files = flags.files,
-        }, label, 0);
-    }
+/// How long a manifest Steam refused waits before it is asked for again, and how long
+/// any other failure does. Steam logs in afresh for every attempt, so this is also
+/// what keeps a refused branch from turning into a login every few seconds.
+const denied_backoff: i64 = 15 * 60;
+const failed_backoff: i64 = 5 * 60;
 
-    const app = try tact.steam.fetchApp(arena, io_, appid, flags.branch);
-    const br = app.branch(flags.branch) orelse return error.NoSuchBranch;
-    note("[capture] {s} branch {s} build {s}: {d} depots, {d:.1} GB{s}\n", .{
-        app.name, br.name, br.build_id, app.depots.len, gb(app.totalSize()),
-        if (flags.files != null) " (filtered)" else "",
-    });
-
-    var done: usize = 0;
-    var failed: usize = 0;
-    for (app.depots) |d| {
-        if (d.manifest.len == 0) continue; // no content on this branch
-        if (flags.depot) |only| if (!std.mem.eql(u8, only, d.id)) continue;
-        captureDepot(gpa, arena, store, login, app.appid, flags, .{
-            .depot = d.id,
-            .manifest = d.manifest,
-            .branch = br.name,
-            .files = flags.files,
-        }, br.build_id, d.size) catch {
-            failed += 1;
-            continue;
-        };
-        done += 1;
-    }
-
-    if (done != 0 or failed != 0) {
-        try alert(arena, flags.webhook, try std.fmt.allocPrint(arena, "STEAM {s} ({s}) build {s}: {d} depots captured, {d} failed", .{
-            app.appid, app.name, br.build_id, done, failed,
-        }));
-    }
-    if (failed != 0) return error.CaptureIncomplete;
-}
-
-/// Download one depot at one manifest and put it in the store under
-/// `steam/<app>/<branch>/<label>/<depot>/`. `label` is the build id for a current
-/// build, or `manifest-<gid>` for an older one PICS no longer names.
-///
-/// The marker holds the manifest id, so a depot republished under the same label is
-/// captured again rather than skipped, and a half-finished run resumes at the depot
-/// it stopped on.
-fn captureDepot(
+const Capture = struct {
     gpa: std.mem.Allocator,
-    arena: std.mem.Allocator,
     store: *tact.Store,
     login: tact.steam.Login,
-    appid: []const u8,
     flags: Flags,
-    job: tact.steam.DepotJob,
-    label: []const u8,
-    declared: u64,
-) !void {
-    var pass = std.heap.ArenaAllocator.init(gpa);
-    defer pass.deinit();
-    const a = pass.allocator();
-    _ = arena;
+    login_hint: []const u8,
+    /// Depots seen through - listed and captured - keyed by app, branch, depot,
+    /// manifest and mode. Once a depot is in here a pass costs it no request at all;
+    /// the bucket is only asked the first time.
+    done: std.StringHashMapUnmanaged(void) = .empty,
+    /// Not before this time, by the same key: a denial or a failure.
+    held: std.StringHashMapUnmanaged(Hold) = .empty,
+    /// Failures already reported, so a stuck depot says so once.
+    reported: std.StringHashMapUnmanaged(void) = .empty,
+    /// What the last login failure said, for the alert.
+    login_reason: []const u8 = "",
+    failures: usize = 0,
+    /// DepotDownloader runs left for this app this pass; null is unlimited.
+    budget: ?usize = null,
 
-    const marker = try std.fmt.allocPrint(a, "steam/{s}/state/captured-{s}-{s}-{s}", .{ appid, job.branch, label, job.depot });
-    if (std.mem.eql(u8, try store.readText(a, marker), job.manifest)) return;
+    const Hold = struct { until: i64, denied: bool, reason: []const u8 };
 
-    const dir = try std.fmt.allocPrint(a, "{s}/{s}-{s}", .{ flags.scratch, appid, job.depot });
-    note("[capture] depot {s} manifest {s}", .{ job.depot, job.manifest });
-    if (declared != 0) note(" ({d:.1} GB declared)", .{gb(declared)});
-    note(" -> {s}/{s}\n", .{ label, job.depot });
-
-    tact.steam.downloadDepot(a, io_, login, appid, job, dir) catch |err| {
-        note("[capture] depot {s}: {s}\n", .{ job.depot, @errorName(err) });
-        try alert(a, flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} depot {s} ({s}) DOWNLOAD FAILED ({s})", .{ appid, job.depot, label, @errorName(err) }));
-        return err;
+    const Status = union(enum) {
+        unchanged,
+        /// Work to do, but not this pass: out of budget.
+        queued,
+        captured: struct {
+            bytes: u64,
+            /// Refused before, served now: the thing all of this waits for.
+            jackpot: bool = false,
+        },
+        /// Refused for the first time: worth one alert.
+        denied_new: []const u8,
+        /// Refused again, or not asked because it was refused recently.
+        denied,
+        failed,
     };
 
-    const prefix = try std.fmt.allocPrint(a, "steam/{s}/{s}/{s}/{s}", .{ appid, job.branch, label, job.depot });
-    const n = uploadTree(a, store, dir, prefix) catch |err| {
-        note("[capture] depot {s}: upload: {s}\n", .{ job.depot, @errorName(err) });
-        return err;
-    };
+    fn deinit(self: *Capture) void {
+        self.gpa.free(self.login_reason);
+        freeKeys(self.gpa, &self.done);
+        var it = self.held.iterator();
+        while (it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.reason);
+        }
+        self.held.deinit(self.gpa);
+        freeKeys(self.gpa, &self.reported);
+    }
 
-    // Only once the bytes are safely in the store: the scratch copy is the only other
-    // copy until then.
-    std.Io.Dir.cwd().deleteTree(io_, dir) catch |err| note("[capture] depot {s}: scratch not removed: {s}\n", .{ job.depot, @errorName(err) });
-    try store.writeObject(a, marker, job.manifest);
-    note("[capture] depot {s}: {d:.1} MB stored under {s}\n", .{ job.depot, mb(n), label });
+    fn freeKeys(gpa: std.mem.Allocator, map: *std.StringHashMapUnmanaged(void)) void {
+        var it = map.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        map.deinit(gpa);
+    }
+
+    fn remember(self: *Capture, key: []const u8) !void {
+        self.release(key);
+        if (self.done.contains(key)) return;
+        try self.done.put(self.gpa, try self.gpa.dupe(u8, key), {});
+    }
+
+    fn hold(self: *Capture, key: []const u8, until: i64, denied: bool, reason: []const u8) !void {
+        const r = try self.gpa.dupe(u8, reason);
+        if (self.held.getPtr(key)) |h| {
+            self.gpa.free(h.reason);
+            h.* = .{ .until = until, .denied = denied, .reason = r };
+            return;
+        }
+        try self.held.put(self.gpa, try self.gpa.dupe(u8, key), .{ .until = until, .denied = denied, .reason = r });
+    }
+
+    fn release(self: *Capture, key: []const u8) void {
+        if (self.held.fetchRemove(key)) |kv| {
+            self.gpa.free(kv.key);
+            self.gpa.free(kv.value.reason);
+        }
+    }
+
+    /// Take `runs` DepotDownloader runs from the budget, or none if it cannot cover
+    /// the first. A listing and its capture belong together, so a depot needing both
+    /// gets both once it gets anything.
+    fn spend(self: *Capture, runs: usize) bool {
+        const left = self.budget orelse return true;
+        if (left == 0) return false;
+        self.budget = left -| runs;
+        return true;
+    }
+
+    fn captureApp(self: *Capture, a: std.mem.Allocator, spec: tact.steam.AppSpec) !void {
+        const app = try tact.steam.fetchApp(a, io_, spec.id, "public");
+        const only = spec.branch orelse self.flags.branch;
+
+        // `public` first: a depot another branch shares with it is then already
+        // captured under public's name, and the other branch only has to point at it.
+        const branches = try a.dupe(tact.steam.Branch, app.branches);
+        std.mem.sort(tact.steam.Branch, branches, {}, struct {
+            fn lt(_: void, x: tact.steam.Branch, y: tact.steam.Branch) bool {
+                const xp = std.mem.eql(u8, x.name, "public");
+                const yp = std.mem.eql(u8, y.name, "public");
+                if (xp != yp) return xp;
+                return std.mem.lessThan(u8, x.name, y.name);
+            }
+        }.lt);
+
+        for (branches) |b| {
+            if (only) |o| if (!std.mem.eql(u8, o, b.name)) continue;
+            const have_password = self.login.branch_password.len != 0 and
+                self.flags.branch != null and std.mem.eql(u8, self.flags.branch.?, b.name);
+            if (b.password_required and !have_password) {
+                note("[capture] {s} {s:<8} build {s}: password protected, skipped\n", .{ app.appid, b.name, b.build_id });
+                continue;
+            }
+            try self.captureBranch(a, app, b);
+        }
+    }
+
+    fn captureBranch(self: *Capture, a: std.mem.Allocator, app: tact.steam.App, br: tact.steam.Branch) !void {
+        var captured: usize = 0;
+        var bytes: u64 = 0;
+        var denied = std.array_list.Managed([]const u8).init(a);
+        var jackpots = std.array_list.Managed([]const u8).init(a);
+        var reason: []const u8 = "";
+        // One refused retry per branch per pass stands for the rest: Steam refuses a
+        // branch, not a depot, and each attempt is a full login.
+        var branch_refused = false;
+
+        for (app.depots) |d| {
+            const m = d.on(br.name) orelse continue;
+            if (self.flags.depot) |only| if (!std.mem.eql(u8, only, d.id)) continue;
+            const public_gid = if (d.on("public")) |p| p.gid else "";
+            const st = try self.captureDepot(a, app.appid, br, d.id, m, public_gid, &branch_refused);
+            switch (st) {
+                .captured => |c| {
+                    captured += 1;
+                    bytes += c.bytes;
+                    if (c.jackpot) try jackpots.append(d.id);
+                },
+                .denied_new => |why| {
+                    try denied.append(d.id);
+                    reason = why;
+                },
+                .failed => self.failures += 1,
+                .unchanged, .denied, .queued => {},
+            }
+        }
+
+        if (jackpots.items.len != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "@@@ STEAM {s} ({s}) {s} build {s}: {d} depots REFUSED BEFORE, NOW DOWNLOADED: {s} - steam/{s}/{s}/{s}/ @@@", .{
+            app.appid,                                  app.name,  br.name, br.build_id, jackpots.items.len,
+            try std.mem.join(a, " ", jackpots.items), app.appid, br.name, br.build_id,
+        }));
+        if (captured != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} ({s}) {s} build {s}: {d} depots captured, {d:.1} MB", .{
+            app.appid, app.name, br.name, br.build_id, captured, mb(bytes),
+        }));
+        if (denied.items.len != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} ({s}) {s} build {s}: {d} depots refused ({s}): {s}. Retried every {d} min; silent unless one gets through.", .{
+            app.appid,             app.name, br.name, br.build_id, denied.items.len, reason,
+            try std.mem.join(a, " ", denied.items), @divTrunc(denied_backoff, 60),
+        }));
+    }
+
+    fn line(appid: []const u8, br: tact.steam.Branch, depot: []const u8, gid: []const u8, comptime fmt: []const u8, args: anytype) void {
+        note("[capture] {s} {s:<8} {s:<8} {s:<20} " ++ fmt ++ "\n", .{ appid, br.name, depot, gid } ++ args);
+    }
+
+    /// One depot at one manifest on one branch: its listing, then its capture, each
+    /// done once. Logs exactly one line.
+    fn captureDepot(
+        self: *Capture,
+        a: std.mem.Allocator,
+        appid: []const u8,
+        br: tact.steam.Branch,
+        depot: []const u8,
+        m: tact.steam.Manifest,
+        public_gid: []const u8,
+        branch_refused: *bool,
+    ) !Status {
+        const store = self.store;
+        const gid = m.gid;
+        const mode = tact.steam.Mode.choose(m.size, self.flags.whole_under, self.flags.files);
+        var tag_buf: [16]u8 = undefined;
+        const mode_tag = mode.tag(&tag_buf);
+        const key = try std.fmt.allocPrint(a, "{s}/{s}/{s}/{s}/{s}", .{ appid, br.name, depot, gid, mode_tag });
+        const now = nowSecs();
+
+        if (self.done.contains(key)) {
+            line(appid, br, depot, gid, "unchanged", .{});
+            return .unchanged;
+        }
+        if (self.held.get(key)) |h| if (now < h.until) {
+            if (h.denied) {
+                line(appid, br, depot, gid, "denied ({s}), retry in {d}s", .{ h.reason, h.until - now });
+                return .denied;
+            }
+            line(appid, br, depot, gid, "failed ({s}), retry in {d}s", .{ h.reason, h.until - now });
+            return .failed;
+        };
+
+        // Out of runs: do not even ask the bucket what is missing.
+        if (self.budget) |left| if (left == 0) {
+            line(appid, br, depot, gid, "queued (another app has this pass)", .{});
+            return .queued;
+        };
+
+        const listing_key = try std.fmt.allocPrint(a, "steam/{s}/listings/{s}/{s}.txt", .{ appid, depot, gid });
+        var listed = (try store.objectSize(a, listing_key)) != null;
+        const marker_key = try std.fmt.allocPrint(a, "steam/{s}/state/captured-{s}-{s}-{s}", .{ appid, br.name, br.build_id, depot });
+        const want = try tact.steam.markerValue(a, gid, mode);
+        var captured = std.mem.eql(u8, try store.readText(a, marker_key), want);
+
+        // The same manifest on another branch is the same bytes, already stored under
+        // that branch's name - point at it instead of downloading it again.
+        const shared_key = try std.fmt.allocPrint(a, "steam/{s}/state/manifest-{s}-{s}", .{ appid, depot, gid });
+        var same_as: []const u8 = "";
+        if (!captured) {
+            const where = try store.readText(a, shared_key);
+            if (where.len > mode_tag.len and std.mem.startsWith(u8, where, mode_tag) and where[mode_tag.len] == ' ') {
+                same_as = where[mode_tag.len + 1 ..];
+                try store.writeObject(a, marker_key, want);
+                captured = true;
+            }
+        }
+        if (listed and captured) {
+            try self.remember(key);
+            if (same_as.len != 0)
+                line(appid, br, depot, gid, "unchanged (same manifest as {s})", .{same_as})
+            else
+                line(appid, br, depot, gid, "unchanged", .{});
+            return .unchanged;
+        }
+
+        const denied_key = try std.fmt.allocPrint(a, "steam/{s}/state/denied-{s}-{s}-{s}", .{ appid, br.name, br.build_id, depot });
+        const retry = tact.steam.retryDenied(try store.readText(a, denied_key), gid, now, denied_backoff);
+        switch (retry) {
+            .wait => |s| {
+                try self.hold(key, now + s, true, "refused earlier");
+                line(appid, br, depot, gid, "denied (refused earlier), retry in {d}s", .{s});
+                return .denied;
+            },
+            .again => if (branch_refused.*) {
+                try store.writeObject(a, denied_key, try std.fmt.allocPrint(a, "{s} {d}", .{ gid, now }));
+                try self.hold(key, now + denied_backoff, true, "branch still refused");
+                line(appid, br, depot, gid, "denied (branch still refused), retry in {d}s", .{denied_backoff});
+                return .denied;
+            },
+            .fresh, .lifted => {},
+        }
+
+        if (!self.spend(if (listed) 1 else 2)) {
+            line(appid, br, depot, gid, "queued (another app has this pass)", .{});
+            return .queued;
+        }
+
+        if (!listed) {
+            const run = try self.list(a, appid, br, depot, gid, public_gid);
+            switch (run.outcome.kind) {
+                .ok => listed = true,
+                .denied => return self.refused(a, key, denied_key, appid, br, depot, gid, retry, run.outcome.reason, branch_refused),
+                .login => return self.loginRefused(run.outcome.reason),
+                .failed => return self.failed(a, key, appid, br, depot, gid, "listing", run),
+            }
+        }
+
+        var got: u64 = 0;
+        if (!captured) {
+            const dir = try std.fmt.allocPrint(a, "{s}/{s}-{s}", .{ self.flags.scratch, appid, depot });
+            const run = try tact.steam.downloadDepot(a, io_, self.login, appid, .{
+                .depot = depot,
+                .manifest = gid,
+                .branch = br.name,
+                .files = switch (mode) {
+                    .whole => null,
+                    .files => |pat| pat,
+                },
+            }, dir);
+            switch (run.outcome.kind) {
+                .ok => {},
+                .denied => {
+                    std.Io.Dir.cwd().deleteTree(io_, dir) catch {};
+                    return self.refused(a, key, denied_key, appid, br, depot, gid, retry, run.outcome.reason, branch_refused);
+                },
+                .login => return self.loginRefused(run.outcome.reason),
+                .failed => return self.failed(a, key, appid, br, depot, gid, "download", run),
+            }
+            const prefix = try std.fmt.allocPrint(a, "steam/{s}/{s}/{s}/{s}", .{ appid, br.name, br.build_id, depot });
+            got = uploadTree(a, store, dir, prefix) catch |err| {
+                const why = try std.fmt.allocPrint(a, "upload: {s}", .{@errorName(err)});
+                return self.failed(a, key, appid, br, depot, gid, "upload", .{ .outcome = .{ .kind = .failed, .reason = why }, .output = "" });
+            };
+            // Only once the bytes are safely in the store: the scratch copy is the
+            // only other copy until then.
+            std.Io.Dir.cwd().deleteTree(io_, dir) catch |err| note("[capture] {s}: scratch not removed: {s}\n", .{ dir, @errorName(err) });
+            try store.writeObject(a, marker_key, want);
+            try store.writeObject(a, shared_key, try std.fmt.allocPrint(a, "{s} {s}/{s}", .{ mode_tag, br.name, br.build_id }));
+        }
+
+        // Refused before and served now; the branch summary says so, loudly.
+        const jackpot = retry == .again;
+        if (jackpot) try store.writeObject(a, denied_key, try std.fmt.allocPrint(a, "{s} {d} lifted", .{ gid, now }));
+        try self.remember(key);
+        if (captured)
+            line(appid, br, depot, gid, "listed", .{})
+        else
+            line(appid, br, depot, gid, "captured {s} {d:.1} MB", .{ mode_tag, mb(got) });
+        if (captured and !jackpot) return .unchanged;
+        return .{ .captured = .{ .bytes = got, .jackpot = jackpot } };
+    }
+
+    /// Fetch the manifest's file listing and keep it, then hold it up against the
+    /// depot's previous one. Every manifest gets one, including the big data depots
+    /// that are only captured filtered: the listing is what shows a file the filter
+    /// would never have asked for.
+    fn list(self: *Capture, a: std.mem.Allocator, appid: []const u8, br: tact.steam.Branch, depot: []const u8, gid: []const u8, public_gid: []const u8) !tact.steam.Run {
+        const dir = try std.fmt.allocPrint(a, "{s}/{s}-{s}-listing", .{ self.flags.scratch, appid, depot });
+        defer std.Io.Dir.cwd().deleteTree(io_, dir) catch {};
+        var run = try tact.steam.downloadDepot(a, io_, self.login, appid, .{
+            .depot = depot,
+            .manifest = gid,
+            .branch = br.name,
+            .manifest_only = true,
+        }, dir);
+        if (run.outcome.kind != .ok) return run;
+
+        const path = try tact.steam.listingPath(a, dir, depot, gid);
+        const text = std.Io.Dir.cwd().readFileAlloc(io_, path, a, .limited(512 << 20)) catch |err| {
+            run.outcome = .{ .kind = .failed, .reason = @errorName(err) };
+            return run;
+        };
+        const store = self.store;
+        const listing_key = try std.fmt.allocPrint(a, "steam/{s}/listings/{s}/{s}", .{ appid, depot, gid });
+        try store.writeObject(a, try std.fmt.allocPrint(a, "{s}.txt", .{listing_key}), text);
+        const files = try tact.steam.parseListing(a, text);
+
+        // What to hold it up against: this branch's previous manifest of the depot,
+        // and - for any other branch - what public is serving, since a build that is
+        // not public yet is interesting precisely for how it differs from retail.
+        const Ref = struct { label: []const u8, gid: []const u8, files: []const tact.steam.ListedFile };
+        var refs = std.array_list.Managed(Ref).init(a);
+        const last_key = try std.fmt.allocPrint(a, "steam/{s}/state/listed-{s}-{s}", .{ appid, br.name, depot });
+        const prev_gid = try store.readText(a, last_key);
+        const candidates = [_]struct { label: []const u8, gid: []const u8 }{
+            .{ .label = br.name, .gid = prev_gid },
+            .{ .label = "public", .gid = if (std.mem.eql(u8, br.name, "public")) "" else public_gid },
+        };
+        for (candidates) |c| {
+            if (c.gid.len == 0 or std.mem.eql(u8, c.gid, gid)) continue;
+            if (refs.items.len != 0 and std.mem.eql(u8, refs.items[0].gid, c.gid)) continue;
+            const pkey = try std.fmt.allocPrint(a, "steam/{s}/listings/{s}/{s}.txt", .{ appid, depot, c.gid });
+            const ptext = (try store.readObject(a, pkey, null)) orelse continue;
+            try refs.append(.{ .label = c.label, .gid = c.gid, .files = try tact.steam.parseListing(a, ptext) });
+        }
+
+        // Loud: what a debug build looks like.
+        var loud = std.Io.Writer.Allocating.init(a);
+        var n_loud: usize = 0;
+        {
+            const first = try tact.steam.anomalies(a, if (refs.items.len != 0) refs.items[0].files else null, files);
+            for (first) |f| if (f == .pdb) {
+                try loud.writer.print("\n  symbols: {s}", .{f.pdb});
+                n_loud += 1;
+            };
+        }
+        for (refs.items) |r| {
+            for (try tact.steam.anomalies(a, r.files, files)) |f| {
+                switch (f) {
+                    .pdb => continue,
+                    .new_exe => |n| try loud.writer.print("\n  new executable vs {s}: {s}", .{ r.label, n }),
+                    .gone_exe => |n| try loud.writer.print("\n  executable gone vs {s}: {s}", .{ r.label, n }),
+                    .grew => |g| try loud.writer.print("\n  {s} {d:.1} MB -> {d:.1} MB vs {s}", .{ g.name, mb(g.was), mb(g.now), r.label }),
+                }
+                n_loud += 1;
+            }
+        }
+        if (n_loud != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "@@@ STEAM {s} {s} build {s} depot {s} manifest {s} LOOKS UNUSUAL:{s}\nlisting: {s}.txt @@@", .{
+            appid, br.name, br.build_id, depot, gid, loud.written(), listing_key,
+        }));
+
+        // Quiet: every size change worth a look, one message per manifest, and the
+        // whole diff kept beside the listing.
+        if (refs.items.len != 0) {
+            var full = std.Io.Writer.Allocating.init(a);
+            var hint = std.Io.Writer.Allocating.init(a);
+            var n_hint: usize = 0;
+            for (refs.items) |r| {
+                const changes = try tact.steam.diffListings(a, r.files, files);
+                try full.writer.print("# {s} depot {s}: manifest {s} ({s}) against {s} ({s}): {d} changes\n", .{ appid, depot, gid, br.name, r.gid, r.label, changes.len });
+                for (changes) |c| {
+                    try writeChange(&full.writer, c);
+                    try full.writer.writeAll("\n");
+                }
+                if (changes.len == 0) continue;
+                try hint.writer.print("\nvs {s} {s}: {d} changed", .{ r.label, r.gid, changes.len });
+                const shown = @min(changes.len, 10);
+                for (changes[0..shown]) |c| {
+                    try hint.writer.writeAll("\n ");
+                    try writeChange(&hint.writer, c);
+                }
+                if (changes.len > shown) try hint.writer.print("\n  (+{d} more)", .{changes.len - shown});
+                n_hint += changes.len;
+            }
+            try store.writeObject(a, try std.fmt.allocPrint(a, "{s}.diff.txt", .{listing_key}), full.written());
+            if (n_hint != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} {s} build {s} depot {s} manifest {s}: files changed{s}\ndiff: {s}.diff.txt", .{
+                appid, br.name, br.build_id, depot, gid, hint.written(), listing_key,
+            }));
+        }
+        try store.writeObject(a, last_key, gid);
+        return run;
+    }
+
+    fn refused(
+        self: *Capture,
+        a: std.mem.Allocator,
+        key: []const u8,
+        denied_key: []const u8,
+        appid: []const u8,
+        br: tact.steam.Branch,
+        depot: []const u8,
+        gid: []const u8,
+        retry: tact.steam.Retry,
+        reason: []const u8,
+        branch_refused: *bool,
+    ) !Status {
+        const now = nowSecs();
+        try self.store.writeObject(a, denied_key, try std.fmt.allocPrint(a, "{s} {d}", .{ gid, now }));
+        try self.hold(key, now + denied_backoff, true, reason);
+        if (retry == .again) branch_refused.* = true;
+        line(appid, br, depot, gid, "denied ({s}), retry in {d}s", .{ reason, denied_backoff });
+        return if (retry == .again) .denied else .{ .denied_new = reason };
+    }
+
+    fn failed(
+        self: *Capture,
+        a: std.mem.Allocator,
+        key: []const u8,
+        appid: []const u8,
+        br: tact.steam.Branch,
+        depot: []const u8,
+        gid: []const u8,
+        what: []const u8,
+        run: tact.steam.Run,
+    ) !Status {
+        const now = nowSecs();
+        try self.hold(key, now + failed_backoff, false, run.outcome.reason);
+        line(appid, br, depot, gid, "{s} failed ({s}), retry in {d}s", .{ what, run.outcome.reason, failed_backoff });
+        if (!self.reported.contains(key)) {
+            try self.reported.put(self.gpa, try self.gpa.dupe(u8, key), {});
+            // What DepotDownloader said, once, for whoever has to work out why.
+            var tail = std.mem.splitBackwardsScalar(u8, std.mem.trimEnd(u8, run.output, " \r\n"), '\n');
+            var lines: [12][]const u8 = undefined;
+            var n: usize = 0;
+            while (tail.next()) |l| {
+                if (n == lines.len) break;
+                lines[n] = l;
+                n += 1;
+            }
+            while (n > 0) : (n -= 1) note("    | {s}\n", .{lines[n - 1]});
+            try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} {s} build {s} depot {s} manifest {s}: {s} FAILED ({s}), retrying every {d} min", .{
+                appid, br.name, br.build_id, depot, gid, what, run.outcome.reason, @divTrunc(failed_backoff, 60),
+            }));
+        }
+        return .failed;
+    }
+
+    fn loginRefused(self: *Capture, reason: []const u8) anyerror {
+        self.gpa.free(self.login_reason);
+        self.login_reason = self.gpa.dupe(u8, reason) catch "";
+        return error.SteamLogin;
+    }
+
+    /// The stored token was refused. Nothing unattended fixes that, so say how to -
+    /// but at most once an hour, and remembered in the store so a restart does not
+    /// say it again.
+    fn loginFailed(self: *Capture, a: std.mem.Allocator) !void {
+        note("[capture] Steam login failed ({s}); needs an interactive login\n", .{self.login_reason});
+        const key = "steam/state/login-alert";
+        const last = std.fmt.parseInt(i64, try self.store.readText(a, key), 10) catch 0;
+        const now = nowSecs();
+        if (now - last < 3600) return;
+        try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "@@@ STEAM LOGIN NEEDED - captures are stopped: DepotDownloader said \"{s}\". To fix: {s} @@@", .{ self.login_reason, self.login_hint }));
+        try self.store.writeObject(a, key, try std.fmt.allocPrint(a, "{d}", .{now}));
+    }
+};
+
+/// An explicit manifest is a build PICS no longer lists - the only way to reach one of
+/// Steam's older builds, since the record only ever names what is current. It is
+/// stored under the manifest id, because that is the only name it has.
+fn captureManifest(arena: std.mem.Allocator, store: *tact.Store, login: tact.steam.Login, flags: Flags, gid: []const u8) !void {
+    const depot = flags.depot orelse fail("--manifest needs --depot", .{});
+    const branch = flags.branch orelse "public";
+    var apps = std.mem.tokenizeAny(u8, flags.app, " ,");
+    const appid = apps.next() orelse fail("--manifest needs one --app", .{});
+    const label = try std.fmt.allocPrint(arena, "manifest-{s}", .{gid});
+    const mode: tact.steam.Mode = if (flags.files) |pat| .{ .files = pat } else .whole;
+
+    const marker = try std.fmt.allocPrint(arena, "steam/{s}/state/captured-{s}-{s}-{s}", .{ appid, branch, label, depot });
+    const want = try tact.steam.markerValue(arena, gid, mode);
+    if (std.mem.eql(u8, try store.readText(arena, marker), want)) {
+        note("[capture] depot {s} manifest {s}: already captured\n", .{ depot, gid });
+        return;
+    }
+
+    const dir = try std.fmt.allocPrint(arena, "{s}/{s}-{s}", .{ flags.scratch, appid, depot });
+    note("[capture] depot {s} manifest {s} -> {s}/{s}\n", .{ depot, gid, label, depot });
+    const run = try tact.steam.downloadDepot(arena, io_, login, appid, .{
+        .depot = depot,
+        .manifest = gid,
+        .branch = branch,
+        .files = flags.files,
+    }, dir);
+    if (run.outcome.kind != .ok) {
+        std.debug.print("{s}", .{run.output});
+        note("[capture] depot {s}: {s} ({s})\n", .{ depot, @tagName(run.outcome.kind), run.outcome.reason });
+        try alert(arena, flags.webhook, try std.fmt.allocPrint(arena, "STEAM {s} depot {s} ({s}) DOWNLOAD FAILED ({s})", .{ appid, depot, label, run.outcome.reason }));
+        return error.DepotDownloadFailed;
+    }
+
+    const prefix = try std.fmt.allocPrint(arena, "steam/{s}/{s}/{s}/{s}", .{ appid, branch, label, depot });
+    const n = try uploadTree(arena, store, dir, prefix);
+    std.Io.Dir.cwd().deleteTree(io_, dir) catch |err| note("[capture] depot {s}: scratch not removed: {s}\n", .{ depot, @errorName(err) });
+    try store.writeObject(arena, marker, want);
+    note("[capture] depot {s}: {d:.1} MB stored under {s}\n", .{ depot, mb(n), label });
+}
+
+/// `  name  12.3 MB -> 14.0 MB`, with "absent" for a side that has no such file.
+fn writeChange(w: *std.Io.Writer, c: tact.steam.Change) !void {
+    try w.print(" {s}  ", .{c.name});
+    if (c.was) |v| try w.print("{d:.2} MB", .{mb(v)}) else try w.writeAll("absent");
+    try w.writeAll(" -> ");
+    if (c.now) |v| try w.print("{d:.2} MB", .{mb(v)}) else try w.writeAll("absent");
 }
 
 /// Copy every file under `dir` into the store beneath `prefix`, keeping the tree.
@@ -811,6 +1351,9 @@ fn uploadTree(a: std.mem.Allocator, store: *tact.Store, dir: []const u8, prefix:
     return total;
 }
 
+/// An absent state object is "never seen"; an unreadable one is an error, because
+/// treating a failed read as "never seen" would alert about a build that is already
+/// recorded - and keep doing it every pass.
 fn readState(a: std.mem.Allocator, root: *tact.Store, product: []const u8, suffix: []const u8) ![]const u8 {
     const key = try std.fmt.allocPrint(a, "state/{s}{s}", .{ product, suffix });
     return root.readText(a, key);
@@ -821,8 +1364,13 @@ fn writeState(a: std.mem.Allocator, root: *tact.Store, product: []const u8, suff
     try root.writeObject(a, key, value);
 }
 
-fn alert(gpa: std.mem.Allocator, webhook: ?[]const u8, msg: []const u8) !void {
-    std.debug.print(">> {s}\n", .{msg});
+fn alert(gpa: std.mem.Allocator, webhook: ?[]const u8, full: []const u8) !void {
+    std.debug.print(">> {s}\n", .{full});
+    // Discord refuses a message over 2000 characters outright; a cut one still says
+    // what happened, and the log above has all of it.
+    var cut: usize = @min(full.len, 1900);
+    while (cut < full.len and cut > 0 and full[cut] & 0xC0 == 0x80) cut -= 1; // not mid-character
+    const msg = if (cut < full.len) try std.fmt.allocPrint(gpa, "{s}\n(cut; the log has the rest)", .{full[0..cut]}) else full;
     const url = webhook orelse return;
     if (url.len == 0) return;
     var client: std.http.Client = .{ .allocator = gpa, .io = io_ };

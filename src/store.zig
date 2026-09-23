@@ -18,6 +18,12 @@ fn stripScheme(v: []const u8) []const u8 {
 }
 
 pub const Store = struct {
+    /// What the store and its bucket client allocate from. A long-running command
+    /// must pass a real allocator here, not an arena: every request allocates and
+    /// frees, and an arena only ever grows.
+    gpa: std.mem.Allocator,
+    /// The store's own strings, freed together by `close`.
+    strings: std.heap.ArenaAllocator,
     io: std.Io,
     /// What was asked for, kept verbatim for logging.
     spec: []const u8,
@@ -30,9 +36,13 @@ pub const Store = struct {
 
     /// `spec` is either `s3://<bucket>/<prefix>` or a filesystem path. Returned by
     /// pointer: a bucket owns an http client, which must not move afterwards.
-    pub fn open(a: std.mem.Allocator, io: std.Io, spec: []const u8, ep: ?s3.Endpoint) !*Store {
-        const self = try a.create(Store);
-        self.* = .{ .io = io, .spec = try a.dupe(u8, spec), .where = undefined };
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, spec: []const u8, ep: ?s3.Endpoint) !*Store {
+        const self = try gpa.create(Store);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .strings = .init(gpa), .io = io, .spec = "", .where = undefined };
+        errdefer self.strings.deinit();
+        const a = self.strings.allocator();
+        self.spec = try a.dupe(u8, spec);
 
         if (!std.mem.startsWith(u8, spec, "s3://")) {
             self.where = .{ .dir = self.spec };
@@ -49,7 +59,7 @@ pub const Store = struct {
         if (e.host.len == 0) return error.MissingS3Endpoint;
         if (e.access_key.len == 0 or e.secret_key.len == 0) return error.MissingS3Credentials;
 
-        self.where = .{ .bucket = s3.Bucket.init(a, io, .{
+        self.where = .{ .bucket = s3.Bucket.init(gpa, io, .{
             .host = try a.dupe(u8, stripScheme(e.host)),
             .region = try a.dupe(u8, e.region),
             .access_key = try a.dupe(u8, e.access_key),
@@ -65,6 +75,9 @@ pub const Store = struct {
             .dir => {},
             .bucket => |*b| b.deinit(),
         }
+        const gpa = self.gpa;
+        self.strings.deinit();
+        gpa.destroy(self);
     }
 
     pub fn isBucket(self: *const Store) bool {

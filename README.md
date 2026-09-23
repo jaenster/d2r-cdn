@@ -86,6 +86,35 @@ Two things Steam gives that the TACT path does not: a manifest id stays fetchabl
 after its build has rotated out (a delisted TACT config just returns 403), and the
 `privatebranches` flag tells you when there are branches you cannot see.
 
+`steam-capture` takes the bytes, with an owning account logged in once through
+DepotDownloader (it keeps the token under `$HOME`):
+
+```
+d2r-cdn steam-capture s3://my-bucket/d2r --interval 20 \
+  --files '.*\.(exe|dll|pdb|map|sym)$' --scratch /scratch
+```
+
+Every pass it reads the branch table and, for every branch, every depot's manifest:
+
+- **Listing** — each manifest's file list (names and sizes) is stored once, under
+  `steam/<app>/listings/<depot>/<manifest>.txt`, and compared with that branch's
+  previous manifest and with what public serves. A `.pdb`, an executable that was not
+  there before, or one that grew by half is a loud alert; any other file added,
+  removed or resized by a fifth (or 5MB) is one quiet message per manifest, with the
+  diff stored beside the listing.
+- **Capture** — depots smaller than `--whole-under` (512MB) are taken whole, bigger
+  ones only for the files `--files` names. The capture marker records the manifest and
+  the mode, so widening the filter captures the build again.
+- **Refused** — a manifest Steam will not serve this account (a `local` branch needs a
+  Local Content Server entitlement, not just ownership) is recorded, alerted once, and
+  asked for again every 15 minutes. If it is ever served, that is the loudest alert
+  there is.
+
+A depot it has seen through costs nothing on later passes, so a 20s loop is cheap.
+`--app 2536520,2344520@300:public` polls the second app at most every 300s and only
+on `public`; apps after the first also get one DepotDownloader run a pass, so their new
+builds never hold up the first one's cadence.
+
 ## Library
 
 ```

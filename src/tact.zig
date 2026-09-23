@@ -280,7 +280,7 @@ pub const Cdn = struct {
             .cdn_cfg = "",
         };
 
-        if (self.opts.pool) |spec| self.pool = try Store.open(a, io, spec, self.opts.s3);
+        if (self.opts.pool) |spec| self.pool = try Store.open(gpa, io, spec, self.opts.s3);
 
         const vrow = regionLine(try self.service("versions"), self.opts.region, self.opts.any_region);
         if (vrow.len == 0) return error.NoBuild;
@@ -786,6 +786,10 @@ pub fn globMatch(pattern: []const u8, name: []const u8) bool {
     }
     while (p < pattern.len and pattern[p] == '*') p += 1;
     return p == pattern.len;
+}
+
+test {
+    _ = steam;
 }
 
 test "blte round-trip of a raw single chunk" {
