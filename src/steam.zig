@@ -242,6 +242,21 @@ pub const AppSpec = struct {
     }
 };
 
+/// Milliseconds from `now_ms` (wall clock) to this replica's next turn, when `n`
+/// replicas share one `interval_s` and each owns an equal slice of it.
+///
+/// Wall clock rather than "sleep an interval after my last pass": replicas start at
+/// different moments and each pass takes a little while, so relative sleeps drift
+/// into bunches. Anchored to the clock, three replicas on 60s poll at :00, :20 and
+/// :40 however they were started.
+pub fn untilSlot(now_ms: i64, interval_s: u32, slot: u32, n: u32) i64 {
+    const period: i64 = @as(i64, interval_s) * 1000;
+    if (period == 0) return 0;
+    const off = @divTrunc(period * @as(i64, slot % @max(n, 1)), @as(i64, @max(n, 1)));
+    const next = @divFloor(now_ms - off, period) * period + off + period;
+    return next - now_ms;
+}
+
 // ---- capturing a build ---------------------------------------------------------
 
 /// How to reach DepotDownloader, and what it needs to log in.
@@ -813,4 +828,18 @@ test "listing diff" {
     try testing.expect(sizeChanged(1000, 799));
     try testing.expect(sizeChanged(1 << 30, (1 << 30) + 5 * 1024 * 1024 + 1));
     try testing.expect(!sizeChanged(1 << 30, (1 << 30) + 5 * 1024 * 1024));
+}
+
+test "replica slots" {
+    // Three replicas on a 60s interval own :00, :20 and :40.
+    try testing.expectEqual(@as(i64, 60_000), untilSlot(0, 60, 0, 3));
+    try testing.expectEqual(@as(i64, 20_000), untilSlot(0, 60, 1, 3));
+    try testing.expectEqual(@as(i64, 40_000), untilSlot(0, 60, 2, 3));
+    try testing.expectEqual(@as(i64, 1_000), untilSlot(19_000, 60, 1, 3));
+    // Exactly on its slot means the next one, never zero.
+    try testing.expectEqual(@as(i64, 60_000), untilSlot(80_000, 60, 1, 3));
+    // Wherever it starts, the next turn lands on the slot.
+    const now: i64 = 1_790_188_000_123;
+    try testing.expectEqual(@as(i64, 40_000), @mod(now + untilSlot(now, 60, 2, 3), 60_000));
+    try testing.expectEqual(@as(i64, 0), @mod(now + untilSlot(now, 60, 0, 1), 60_000));
 }

@@ -570,6 +570,10 @@ fn captureBinaries(a: std.mem.Allocator, cdn: *tact.Cdn, root: *tact.Store, prod
 
 // ---- steam ---------------------------------------------------------------------
 
+fn nowMs() i64 {
+    return @intCast(@divFloor(std.Io.Timestamp.now(io_, .real).nanoseconds, std.time.ns_per_ms));
+}
+
 fn nowSecs() i64 {
     return @intCast(@divFloor(std.Io.Timestamp.now(io_, .real).nanoseconds, std.time.ns_per_s));
 }
@@ -607,14 +611,14 @@ fn steamWatch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.
     // Several replicas watching the same thing should spread themselves across the
     // interval rather than all polling at once: the point of running them on separate
     // hosts is separate egress, which is wasted if they fire together. The slot comes
-    // from the pod's own ordinal, so nothing has to be configured per replica.
+    // from the pod's own ordinal, so nothing has to be configured per replica, and is
+    // held to the wall clock so the replicas stay evenly apart.
+    const slot: u32 = if (flags.stagger > 1) ordinal() % flags.stagger else 0;
+    const slots: u32 = @max(flags.stagger, 1);
     if (flags.stagger > 1 and flags.interval != 0) {
-        const slot = ordinal() % flags.stagger;
-        const offset = @as(u64, flags.interval) * slot / flags.stagger;
-        if (offset != 0) {
-            note("[steam] replica {d}/{d}: first pass in {d}s\n", .{ slot, flags.stagger, offset });
-            try io_.sleep(.fromMilliseconds(@as(i64, @intCast(offset)) * 1000), .awake);
-        }
+        const wait = tact.steam.untilSlot(nowMs(), flags.interval, slot, slots);
+        note("[steam] replica {d}/{d}: first pass in {d}s\n", .{ slot, slots, @divTrunc(wait, 1000) });
+        try io_.sleep(.fromMilliseconds(wait), .awake);
     }
 
     var pass_arena = std.heap.ArenaAllocator.init(gpa);
@@ -633,9 +637,14 @@ fn steamWatch(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tact.
         }
         if (flags.interval == 0) return;
         _ = pass_arena.reset(.{ .retain_with_limit = 4 << 20 });
-        delay = if (limited) @min(@max(delay, flags.interval) * 2, max_backoff) else flags.interval;
-        if (limited) note("[steam] rate limited by the PICS mirror, next pass in {d}s\n", .{delay});
-        try io_.sleep(.fromMilliseconds(@as(i64, delay) * 1000), .awake);
+        if (limited) {
+            delay = @min(@max(delay, flags.interval) * 2, max_backoff);
+            note("[steam] rate limited by the PICS mirror, next pass in {d}s\n", .{delay});
+            try io_.sleep(.fromMilliseconds(@as(i64, delay) * 1000), .awake);
+        } else {
+            delay = flags.interval;
+        }
+        try io_.sleep(.fromMilliseconds(tact.steam.untilSlot(nowMs(), flags.interval, slot, slots)), .awake);
     }
 }
 
