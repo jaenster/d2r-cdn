@@ -1389,12 +1389,29 @@ fn alert(gpa: std.mem.Allocator, webhook: ?[]const u8, full: []const u8) !void {
     try body.writer.writeAll("{\"content\":\"");
     try std.json.Stringify.encodeJsonStringChars(msg, .{}, &body.writer);
     try body.writer.writeAll("\"}");
-    _ = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body.written(),
+    const status = post(&client, url, body.written()) catch |err| {
+        std.debug.print("   (webhook failed: {s})\n", .{@errorName(err)});
+        return;
+    };
+    if (@intFromEnum(status) / 100 != 2) std.debug.print("   (webhook answered {d})\n", .{@intFromEnum(status)});
+}
+
+/// POST and read only the status. Discord answers a webhook with 204 and no length,
+/// and `Client.fetch` then waits for a body until the server gives up on the
+/// connection - minutes, with the whole loop stalled behind it.
+fn post(client: *std.http.Client, url: []const u8, payload: []const u8) !std.http.Status {
+    var req = try client.request(.POST, try std.Uri.parse(url), .{
         .headers = .{ .content_type = .{ .override = "application/json" } },
-    }) catch |err| std.debug.print("   (webhook failed: {s})\n", .{@errorName(err)});
+        .keep_alive = false,
+    });
+    defer req.deinit();
+    req.transfer_encoding = .{ .content_length = payload.len };
+    var bw = try req.sendBodyUnflushed(&.{});
+    try bw.writer.writeAll(payload);
+    try bw.end();
+    try req.connection.?.flush();
+    const res = try req.receiveHead(&.{});
+    return res.head.status;
 }
 
 fn isoNow(gpa: std.mem.Allocator) ![]const u8 {
