@@ -769,7 +769,7 @@ fn steamCapture(gpa: std.mem.Allocator, arena: std.mem.Allocator, base_opts: tac
             // full. The others get one DepotDownloader run a pass, so a new build of
             // theirs is caught up on over a few passes instead of stalling the first
             // app's cadence while it downloads.
-            cap.budget = if (i == 0) null else 1;
+            cap.budget = if (i == 0 or flags.interval == 0) null else 1;
             cap.captureApp(a, spec) catch |err| switch (err) {
                 // Every later depot would fail the same way; one alert, then wait.
                 error.SteamLogin => {
@@ -823,6 +823,24 @@ const Capture = struct {
     failures: usize = 0,
     /// DepotDownloader runs left for this app this pass; null is unlimited.
     budget: ?usize = null,
+    /// Per app, branch and build: what to report once its depots are all through.
+    tallies: std.StringHashMapUnmanaged(Tally) = .empty,
+
+    const Tally = struct {
+        captured: usize = 0,
+        bytes: u64 = 0,
+        denied_n: usize = 0,
+        /// Space-separated depot ids.
+        denied: std.ArrayListUnmanaged(u8) = .empty,
+        jackpots: std.ArrayListUnmanaged(u8) = .empty,
+        /// From `steam.classify`, which only ever names static strings.
+        reason: []const u8 = "",
+
+        fn deinit(self: *Tally, gpa: std.mem.Allocator) void {
+            self.denied.deinit(gpa);
+            self.jackpots.deinit(gpa);
+        }
+    };
 
     const Hold = struct { until: i64, denied: bool, reason: []const u8 };
 
@@ -844,6 +862,12 @@ const Capture = struct {
 
     fn deinit(self: *Capture) void {
         self.gpa.free(self.login_reason);
+        var tit = self.tallies.iterator();
+        while (tit.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            e.value_ptr.deinit(self.gpa);
+        }
+        self.tallies.deinit(self.gpa);
         freeKeys(self.gpa, &self.done);
         var it = self.held.iterator();
         while (it.next()) |e| {
@@ -922,11 +946,16 @@ const Capture = struct {
     }
 
     fn captureBranch(self: *Capture, a: std.mem.Allocator, app: tact.steam.App, br: tact.steam.Branch) !void {
-        var captured: usize = 0;
-        var bytes: u64 = 0;
-        var denied = std.array_list.Managed([]const u8).init(a);
-        var jackpots = std.array_list.Managed([]const u8).init(a);
-        var reason: []const u8 = "";
+        // What this build has done, kept across passes until nothing is queued: an
+        // app on a budget catches up one depot a pass, and should still say so once.
+        const tkey = try std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ app.appid, br.name, br.build_id });
+        const slot = try self.tallies.getOrPut(self.gpa, tkey);
+        if (!slot.found_existing) {
+            slot.key_ptr.* = try self.gpa.dupe(u8, tkey);
+            slot.value_ptr.* = .{};
+        }
+        const t = slot.value_ptr;
+        var queued: usize = 0;
         // One refused retry per branch per pass stands for the rest: Steam refuses a
         // branch, not a depot, and each attempt is a full login.
         var branch_refused = false;
@@ -938,30 +967,35 @@ const Capture = struct {
             const st = try self.captureDepot(a, app.appid, br, d.id, m, public_gid, &branch_refused);
             switch (st) {
                 .captured => |c| {
-                    captured += 1;
-                    bytes += c.bytes;
-                    if (c.jackpot) try jackpots.append(d.id);
+                    t.captured += 1;
+                    t.bytes += c.bytes;
+                    if (c.jackpot) try t.jackpots.print(self.gpa, " {s}", .{d.id});
                 },
                 .denied_new => |why| {
-                    try denied.append(d.id);
-                    reason = why;
+                    t.denied_n += 1;
+                    try t.denied.print(self.gpa, " {s}", .{d.id});
+                    t.reason = why;
                 },
                 .failed => self.failures += 1,
-                .unchanged, .denied, .queued => {},
+                .queued => queued += 1,
+                .unchanged, .denied => {},
             }
         }
+        if (queued != 0) return;
 
-        if (jackpots.items.len != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "@@@ STEAM {s} ({s}) {s} build {s}: {d} depots REFUSED BEFORE, NOW DOWNLOADED: {s} - steam/{s}/{s}/{s}/ @@@", .{
-            app.appid,                                  app.name,  br.name, br.build_id, jackpots.items.len,
-            try std.mem.join(a, " ", jackpots.items), app.appid, br.name, br.build_id,
+        if (t.jackpots.items.len != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "@@@ STEAM {s} ({s}) {s} build {s}: REFUSED BEFORE, NOW DOWNLOADED:{s} - steam/{s}/{s}/{s}/ @@@", .{
+            app.appid, app.name, br.name, br.build_id, t.jackpots.items, app.appid, br.name, br.build_id,
         }));
-        if (captured != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} ({s}) {s} build {s}: {d} depots captured, {d:.1} MB", .{
-            app.appid, app.name, br.name, br.build_id, captured, mb(bytes),
+        if (t.captured != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} ({s}) {s} build {s}: {d} depots captured, {d:.1} MB", .{
+            app.appid, app.name, br.name, br.build_id, t.captured, mb(t.bytes),
         }));
-        if (denied.items.len != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} ({s}) {s} build {s}: {d} depots refused ({s}): {s}. Retried every {d} min; silent unless one gets through.", .{
-            app.appid,             app.name, br.name, br.build_id, denied.items.len, reason,
-            try std.mem.join(a, " ", denied.items), @divTrunc(denied_backoff, 60),
+        if (t.denied_n != 0) try alert(a, self.flags.webhook, try std.fmt.allocPrint(a, "STEAM {s} ({s}) {s} build {s}: {d} depots refused ({s}):{s}. Retried every {d} min; silent unless one gets through.", .{
+            app.appid, app.name, br.name, br.build_id, t.denied_n, t.reason, t.denied.items, @divTrunc(denied_backoff, 60),
         }));
+        const kv = self.tallies.fetchRemove(tkey).?;
+        self.gpa.free(kv.key);
+        var v = kv.value;
+        v.deinit(self.gpa);
     }
 
     fn line(appid: []const u8, br: tact.steam.Branch, depot: []const u8, gid: []const u8, comptime fmt: []const u8, args: anytype) void {
